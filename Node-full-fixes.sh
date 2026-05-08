@@ -126,8 +126,8 @@ killall unattended-upgr 2>/dev/null || true
 rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
 dpkg --configure -a 2>/dev/null || true
 
-apt update -y
-DEBIAN_FRONTEND=noninteractive apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+# apt update -y
+# DEBIAN_FRONTEND=noninteractive apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 
 # Disable auto-updates permanently (prevents future lock issues)
 systemctl disable unattended-upgrades 2>/dev/null || true
