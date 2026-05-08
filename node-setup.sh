@@ -1,9 +1,10 @@
 #!/bin/bash
+set -euo pipefail
 
 # ============================================================
 #   Remnawave Node Setup Script
-#   Based on heatfm.cc setup
-#   Run this on a FRESH VPS to add it as a new node
+#   heatfm.cc Infrastructure
+#   Full-proof version with WARP + SSH protection
 # ============================================================
 
 # --- COLORS ---
@@ -20,6 +21,18 @@ DEFAULT_NODE_PORT="3389"
 DEFAULT_PANEL_URL="https://panel.heatfm.cc"
 DEFAULT_DOMAIN_SUFFIX="heatfm.cc"
 
+# --- ROOT CHECK ---
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}❌ This script must be run as root. Use: sudo bash $0${NC}"
+    exit 1
+fi
+
+# --- OS CHECK ---
+if ! grep -qi "ubuntu\|debian" /etc/os-release 2>/dev/null; then
+    echo -e "${YELLOW}⚠️  Warning: This script is designed for Ubuntu/Debian. Proceed with caution.${NC}"
+    sleep 3
+fi
+
 clear
 echo -e "${CYAN}${BOLD}"
 echo "  ╔══════════════════════════════════════════╗"
@@ -28,29 +41,36 @@ echo "  ║     heatfm.cc Infrastructure            ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo -e "${NC}"
 
+# ============================================================
 # --- GATHER INFO ---
+# ============================================================
 echo -e "${YELLOW}${BOLD}Step 1 — Node Information${NC}"
 echo ""
 
 # Country name
-read -p "$(echo -e ${BLUE}Enter country name [e.g. Netherlands, USA, Finland]: ${NC})" COUNTRY
-if [ -z "$COUNTRY" ]; then
+while true; do
+    read -rp "$(echo -e "${BLUE}Enter country name [e.g. Netherlands, USA, Finland]: ${NC}")" COUNTRY
+    if [ -n "$COUNTRY" ]; then break; fi
     echo -e "${RED}Country name is required!${NC}"
-    exit 1
-fi
+done
 
 # Subdomain
 COUNTRY_LOWER=$(echo "$COUNTRY" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
 DEFAULT_SUBDOMAIN="${COUNTRY_LOWER}.${DEFAULT_DOMAIN_SUFFIX}"
-read -p "$(echo -e ${BLUE}Node subdomain [default: ${DEFAULT_SUBDOMAIN}]: ${NC})" SUBDOMAIN
+read -rp "$(echo -e "${BLUE}Node subdomain [default: ${DEFAULT_SUBDOMAIN}]: ${NC}")" SUBDOMAIN
 SUBDOMAIN=${SUBDOMAIN:-$DEFAULT_SUBDOMAIN}
 
 # Node Port
-read -p "$(echo -e ${BLUE}Node API port [default: ${DEFAULT_NODE_PORT}]: ${NC})" NODE_PORT
+read -rp "$(echo -e "${BLUE}Node API port [default: ${DEFAULT_NODE_PORT}]: ${NC}")" NODE_PORT
 NODE_PORT=${NODE_PORT:-$DEFAULT_NODE_PORT}
+# Validate port is a number
+if ! [[ "$NODE_PORT" =~ ^[0-9]+$ ]] || [ "$NODE_PORT" -lt 1 ] || [ "$NODE_PORT" -gt 65535 ]; then
+    echo -e "${RED}Invalid port. Using default: ${DEFAULT_NODE_PORT}${NC}"
+    NODE_PORT=$DEFAULT_NODE_PORT
+fi
 
 # Panel URL
-read -p "$(echo -e ${BLUE}Panel URL [default: ${DEFAULT_PANEL_URL}]: ${NC})" PANEL_URL
+read -rp "$(echo -e "${BLUE}Panel URL [default: ${DEFAULT_PANEL_URL}]: ${NC}")" PANEL_URL
 PANEL_URL=${PANEL_URL:-$DEFAULT_PANEL_URL}
 
 # Secret Key
@@ -59,11 +79,11 @@ echo -e "${YELLOW}${BOLD}Step 2 — Secret Key${NC}"
 echo -e "${CYAN}Go to your Remnawave panel → Nodes → Add Node${NC}"
 echo -e "${CYAN}Fill in the node details and copy the SECRET_KEY${NC}"
 echo ""
-read -p "$(echo -e ${BLUE}Paste the SECRET_KEY from the panel: ${NC})" SECRET_KEY
-if [ -z "$SECRET_KEY" ]; then
+while true; do
+    read -rp "$(echo -e "${BLUE}Paste the SECRET_KEY from the panel: ${NC}")" SECRET_KEY
+    if [ -n "$SECRET_KEY" ]; then break; fi
     echo -e "${RED}Secret key is required!${NC}"
-    exit 1
-fi
+done
 
 # Confirm
 echo ""
@@ -76,53 +96,101 @@ echo -e "  Node Port  : ${BOLD}$NODE_PORT${NC}"
 echo -e "  Panel URL  : ${BOLD}$PANEL_URL${NC}"
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-read -p "$(echo -e ${YELLOW}Proceed with installation? [y/N]: ${NC})" CONFIRM
+read -rp "$(echo -e "${YELLOW}Proceed with installation? [y/N]: ${NC}")" CONFIRM
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     echo -e "${RED}Installation cancelled.${NC}"
     exit 0
 fi
 
-# --- SYSTEM UPDATE ---
-echo ""
-echo -e "${CYAN}${BOLD}[1/6] Updating system...${NC}"
-apt update -y && apt upgrade -y
-echo -e "${GREEN}✅ System updated${NC}"
+# ============================================================
+# --- HELPER ---
+# ============================================================
+print_step() { echo -e "\n${CYAN}${BOLD}[$1] $2...${NC}"; }
+print_ok()   { echo -e "${GREEN}✅ $1${NC}"; }
+print_err()  { echo -e "${RED}❌ $1${NC}"; }
 
-# --- OPEN FIREWALL PORTS ---
-echo ""
-echo -e "${CYAN}${BOLD}[2/6] Configuring firewall...${NC}"
+# ============================================================
+# [1/7] SYSTEM UPDATE
+# ============================================================
+print_step "1/7" "Updating system packages"
+
+# Wait for any existing apt lock to release
+echo -e "${YELLOW}Waiting for package manager to be available...${NC}"
+while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+    sleep 2
+done
+
+# Kill unattended-upgrades if still running
+systemctl stop unattended-upgrades 2>/dev/null || true
+killall unattended-upgr 2>/dev/null || true
+rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
+dpkg --configure -a 2>/dev/null || true
+
+apt update -y
+DEBIAN_FRONTEND=noninteractive apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+
+# Disable auto-updates permanently (prevents future lock issues)
+systemctl disable unattended-upgrades 2>/dev/null || true
+systemctl stop unattended-upgrades 2>/dev/null || true
+
+print_ok "System updated and auto-upgrades disabled"
+
+# ============================================================
+# [2/7] SET HOSTNAME
+# ============================================================
+print_step "2/7" "Setting hostname"
+hostnamectl set-hostname "${COUNTRY_LOWER}-node"
+print_ok "Hostname set to: ${COUNTRY_LOWER}-node"
+
+# ============================================================
+# [3/7] FIREWALL
+# ============================================================
+print_step "3/7" "Configuring firewall (UFW)"
 ufw allow 22/tcp
-ufw allow 443/tcp
 ufw allow 80/tcp
-ufw allow ${NODE_PORT}/tcp
+ufw allow 443/tcp
+ufw allow "${NODE_PORT}"/tcp
+ufw allow 61000/tcp
 ufw --force enable
 ufw reload
-echo -e "${GREEN}✅ Firewall configured (22, 80, 443, ${NODE_PORT})${NC}"
+print_ok "Firewall configured (22, 80, 443, ${NODE_PORT}, 61000)"
 
-# --- INSTALL DOCKER ---
-echo ""
-echo -e "${CYAN}${BOLD}[3/6] Installing Docker...${NC}"
-if ! command -v docker &> /dev/null; then
-    curl -fsSL https://get.docker.com | sh
-    echo -e "${GREEN}✅ Docker installed${NC}"
+# ============================================================
+# [4/7] INSTALL DOCKER
+# ============================================================
+print_step "4/7" "Installing Docker"
+if command -v docker &>/dev/null; then
+    print_ok "Docker already installed ($(docker --version | cut -d' ' -f3 | tr -d ','))"
 else
-    echo -e "${GREEN}✅ Docker already installed${NC}"
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker
+    systemctl start docker
+    print_ok "Docker installed"
 fi
 
-# --- CREATE REMNANODE ENV ---
-echo ""
-echo -e "${CYAN}${BOLD}[4/6] Creating remnanode configuration...${NC}"
+# Verify docker works
+if ! docker info &>/dev/null; then
+    print_err "Docker failed to start. Aborting."
+    exit 1
+fi
+
+# ============================================================
+# [5/7] CONFIGURE REMNANODE
+# ============================================================
+print_step "5/7" "Creating Remnawave Node configuration"
 mkdir -p /opt/remnanode
 
 cat > /opt/remnanode/.env << EOF
-SECRET_KEY=${SECRET_KEY}
+### NODE ###
 NODE_PORT=${NODE_PORT}
+
+### XRAY ###
+SECRET_KEY=${SECRET_KEY}
+
+### Internal port
+XTLS_API_PORT=61000
 EOF
 
-echo -e "${GREEN}✅ Configuration created${NC}"
-
-# --- CREATE DOCKER COMPOSE ---
-# ✅ FIXED: Removed volumes section that caused mount errors
 cat > /opt/remnanode/docker-compose.yml << 'EOF'
 services:
   remnanode:
@@ -141,26 +209,37 @@ services:
         hard: 1048576
 EOF
 
-echo -e "${GREEN}✅ Docker compose created${NC}"
+print_ok "Configuration created at /opt/remnanode/"
 
-# --- START REMNANODE ---
-echo ""
-echo -e "${CYAN}${BOLD}[5/6] Starting Remnawave Node...${NC}"
+# ============================================================
+# [6/7] START REMNANODE
+# ============================================================
+print_step "6/7" "Starting Remnawave Node"
 cd /opt/remnanode
 docker compose pull
 docker compose up -d
-echo -e "${GREEN}✅ Remnawave Node started${NC}"
 
-# --- FINAL STATUS CHECK ---
-echo ""
-echo -e "${CYAN}${BOLD}[6/6] Checking node status...${NC}"
-sleep 5
-docker compose logs --tail=20
+# Wait and verify
+sleep 6
+if docker ps | grep -q "remnanode"; then
+    print_ok "Remnawave Node is running"
+    docker compose logs --tail=15
+else
+    print_err "Container failed to start. Logs:"
+    docker compose logs --tail=30
+    exit 1
+fi
 
-# --- GET IPV4 ---
-IPV4=$(curl -4 -s ifconfig.me)
+# ============================================================
+# [7/7] GET PUBLIC IP
+# ============================================================
+print_step "7/7" "Detecting public IP"
+IPV4=$(curl -4 -s --max-time 10 ifconfig.me || curl -4 -s --max-time 10 api.ipify.org || echo "UNKNOWN")
+print_ok "Public IP: $IPV4"
 
-# --- DONE ---
+# ============================================================
+# --- SUMMARY ---
+# ============================================================
 echo ""
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${GREEN}${BOLD}  ✅ Node Setup Complete!${NC}"
@@ -184,90 +263,153 @@ echo -e "${CYAN}DNS A Record to add:${NC}"
 echo -e "  ${BOLD}$SUBDOMAIN → $IPV4${NC}"
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
+
 # ============================================================
-# --- OPTIONAL: WARP INSTALLATION ---
+# --- OPTIONAL: WARP ---
 # ============================================================
 echo ""
-read -p "$(echo -e ${YELLOW}Do you want to install WARP \(wg0\) on this node now? [y/N]: ${NC})" INSTALL_WARP
+read -rp "$(echo -e "${YELLOW}Do you want to install WARP (wg0) on this node now? [y/N]: ${NC}")" INSTALL_WARP
 
 if [[ "$INSTALL_WARP" =~ ^[Yy]$ ]]; then
     echo ""
-    echo -e "${CYAN}${BOLD}[Bonus] Installing Cloudflare WARP (Safe wg0 Mode)...${NC}"
+    echo -e "${CYAN}${BOLD}[Bonus] Installing Cloudflare WARP with SSH protection...${NC}"
 
-    # 1. Install WireGuard tools
-    apt install -y wireguard-tools curl resolvconf > /dev/null 2>&1
+    # 1. Install dependencies
+    apt install -y wireguard-tools curl iproute2 >/dev/null 2>&1
+    print_ok "WireGuard tools installed"
 
-    # 2. Download wgcf binary
-    echo -e "${BLUE}  - Downloading WARP generator...${NC}"
-    wget -qO /usr/local/bin/wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64
+    # 2. Download latest wgcf binary
+    echo -e "${BLUE}  - Fetching latest wgcf version...${NC}"
+    WGCF_VER=$(curl -s https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+    if [ -z "$WGCF_VER" ]; then
+        WGCF_VER="v2.2.22"
+        echo -e "${YELLOW}  ⚠️  Could not fetch latest version, using fallback: ${WGCF_VER}${NC}"
+    fi
+    WGCF_VER_NUM="${WGCF_VER#v}"
+    wget -qO /usr/local/bin/wgcf "https://github.com/ViRb3/wgcf/releases/download/${WGCF_VER}/wgcf_${WGCF_VER_NUM}_linux_amd64"
     chmod +x /usr/local/bin/wgcf
+    print_ok "wgcf ${WGCF_VER} installed"
 
-    # 3. Register and generate config
-    mkdir -p /tmp/warp-setup
-    cd /tmp/warp-setup
+    # 3. Register and generate config in temp dir
+    WARP_TMP=$(mktemp -d)
+    cd "$WARP_TMP"
     echo -e "${BLUE}  - Registering WARP device...${NC}"
-    wgcf register --accept-tos 2>&1 | grep -v "GET"
+    wgcf register --accept-tos 2>&1 | grep -v "GET" || true
     echo -e "${BLUE}  - Generating WireGuard config...${NC}"
-    wgcf generate 2>&1 | grep -v "GET"
+    wgcf generate 2>&1 | grep -v "GET" || true
 
-    # 4. Detect gateway and interface dynamically
-    GW=$(ip route show | grep default | awk '{print $3}' | head -1)
-    DEV=$(ip route show | grep default | awk '{print $5}' | head -1)
-    SERVER_IP=$(curl -4 -s ifconfig.me)
-
-    echo -e "${BLUE}  - Detected gateway: ${GW} on interface: ${DEV}${NC}"
-
-    # 5. Extract keys from generated config
-    PRIVKEY=$(grep PrivateKey wgcf-profile.conf | awk '{print $3}')
-    ADDRESS_V4=$(grep Address wgcf-profile.conf | head -1 | awk '{print $3}')
-    ADDRESS_V6=$(grep Address wgcf-profile.conf | tail -1 | awk '{print $3}')
-    PUBKEY=$(grep PublicKey wgcf-profile.conf | awk '{print $3}')
-
-    # 6. Add warp routing table if not present
-    grep -q "^100 warp" /etc/iproute2/rt_tables || echo "100 warp" >> /etc/iproute2/rt_tables
-
-    # 7. Write clean config with persistent routing
-    cat > /etc/wireguard/wg0.conf << EOF
-[Interface]
-PrivateKey = ${PRIVKEY}
-Address = ${ADDRESS_V4}
-Address = ${ADDRESS_V6}
-DNS = 1.1.1.1, 1.0.0.1
-MTU = 1280
-Table = off
-PostUp = ip route add 162.159.192.1 via ${GW} dev ${DEV} || true; ip route add default dev wg0 table warp || true; ip rule add from all lookup warp priority 5000 || true; ip rule add from ${SERVER_IP} lookup main priority 4000 || true
-PreDown = ip route del 162.159.192.1 via ${GW} dev ${DEV} || true; ip rule del priority 5000 || true; ip rule del priority 4000 || true; ip route flush table warp || true
-
-[Peer]
-PublicKey = ${PUBKEY}
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = 162.159.192.1:2408
-PersistentKeepalive = 25
-EOF
-
-    # 8. Enable and start
-    systemctl enable wg-quick@wg0 > /dev/null 2>&1
-    systemctl start wg-quick@wg0
-    sleep 5
-
-    # 9. Cleanup
-    cd /
-    rm -rf /tmp/warp-setup
-
-    # 10. Verify
-    WARP_IP=$(curl -s --max-time 10 https://ipinfo.io/ip)
-    WARP_ORG=$(curl -s --max-time 10 https://ipinfo.io/org)
-    if echo "$WARP_ORG" | grep -qi "cloudflare"; then
-        echo -e "${GREEN}✅ WARP is working! Outbound IP: ${WARP_IP} (${WARP_ORG})${NC}"
+    if [ ! -f wgcf-profile.conf ]; then
+        print_err "wgcf failed to generate config. Skipping WARP."
+        cd /
+        rm -rf "$WARP_TMP"
     else
-        echo -e "${RED}❌ WARP may not be routing correctly. Current IP: ${WARP_IP}${NC}"
-        echo -e "${YELLOW}   Run: sudo wg show — to check handshake status${NC}"
+        # 4. Set full tunnel (AllowedIPs = 0.0.0.0/0) - routing table will handle SSH exclusion
+        sed -i 's|AllowedIPs = .*|AllowedIPs = 0.0.0.0/0|' wgcf-profile.conf
+
+        # 5. Add Table = off so wg-quick does NOT modify default routes
+        #    We manage routing manually below to exclude SSH port 22
+        if ! grep -q "^Table" wgcf-profile.conf; then
+            sed -i '/^\[Interface\]/a Table = off' wgcf-profile.conf
+        else
+            sed -i 's/^Table = .*/Table = off/' wgcf-profile.conf
+        fi
+
+        # 6. Deploy to system WireGuard
+        cp wgcf-profile.conf /etc/wireguard/wg0.conf
+        cd /
+        rm -rf "$WARP_TMP"
+        print_ok "WARP config deployed to /etc/wireguard/wg0.conf"
+
+        # 7. Enable and start WARP interface
+        systemctl enable wg-quick@wg0 >/dev/null 2>&1
+        systemctl start wg-quick@wg0
+        sleep 3
+
+        # 8. Apply routing rules to protect SSH (port 22) from going through WARP
+        echo -e "${BLUE}  - Configuring routing rules (SSH port 22 excluded from WARP)...${NC}"
+
+        # Add custom routing table if not already present
+        grep -q "^100 warp" /etc/iproute2/rt_tables || echo "100 warp" >> /etc/iproute2/rt_tables
+
+        # Add default route for WARP table
+        ip route add default dev wg0 table warp 2>/dev/null || true
+
+        # SSH exclusion rules (priority 4000 - higher priority = evaluated first)
+        ip rule add from all sport 22 lookup main priority 4000 2>/dev/null || true
+        ip rule add to   all dport 22 lookup main priority 4000 2>/dev/null || true
+
+        # Node port exclusion (panel must reach node directly, not through WARP)
+        ip rule add from all sport "${NODE_PORT}" lookup main priority 4001 2>/dev/null || true
+        ip rule add to   all dport "${NODE_PORT}" lookup main priority 4001 2>/dev/null || true
+
+        # All other traffic goes through WARP (priority 5000)
+        ip rule add from all lookup warp priority 5000 2>/dev/null || true
+
+        # 9. Persist routing rules across reboots via systemd service
+        cat > /etc/systemd/system/warp-routing.service << 'SVCEOF'
+[Unit]
+Description=WARP custom routing rules (SSH excluded)
+After=wg-quick@wg0.service
+Wants=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 10
+ExecStart=/bin/bash -c '\
+    grep -q "^100 warp" /etc/iproute2/rt_tables || echo "100 warp" >> /etc/iproute2/rt_tables; \
+    ip route add default dev wg0 table warp 2>/dev/null || true; \
+    ip rule add from all sport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule add to   all dport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule add from all sport '"${NODE_PORT}"' lookup main priority 4001 2>/dev/null || true; \
+    ip rule add to   all dport '"${NODE_PORT}"' lookup main priority 4001 2>/dev/null || true; \
+    ip rule add from all lookup warp priority 5000 2>/dev/null || true'
+ExecStop=/bin/bash -c '\
+    ip rule del from all sport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule del to   all dport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule del from all sport '"${NODE_PORT}"' lookup main priority 4001 2>/dev/null || true; \
+    ip rule del to   all dport '"${NODE_PORT}"' lookup main priority 4001 2>/dev/null || true; \
+    ip rule del from all lookup warp priority 5000 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+        systemctl daemon-reload
+        systemctl enable warp-routing.service >/dev/null 2>&1
+        print_ok "Routing rules persisted via warp-routing.service"
+
+        # 10. Verify WARP is up
+        sleep 2
+        if ip a show wg0 2>/dev/null | grep -q "inet"; then
+            print_ok "WARP is running on wg0"
+            echo ""
+            echo -e "${CYAN}WARP status:${NC}"
+            wg show wg0 2>/dev/null || true
+            echo ""
+            echo -e "${CYAN}Active routing rules:${NC}"
+            ip rule list | grep -E "main|warp" | head -10
+            echo ""
+            echo -e "${GREEN}✅ SSH port 22 is excluded from WARP — your SSH connection is safe.${NC}"
+            echo -e "${CYAN}Note: Make sure your XRay template has outbound pointing to \"interface\": \"wg0\"${NC}"
+        else
+            print_err "WARP interface wg0 failed to start."
+            echo -e "${YELLOW}Debug with: systemctl status wg-quick@wg0${NC}"
+        fi
     fi
 else
     echo -e "${CYAN}Skipping WARP installation.${NC}"
 fi
 
+# ============================================================
+# --- DONE ---
+# ============================================================
 echo ""
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}All done! Exiting...${NC}"
+echo -e "${BOLD}  🎉 All done! Node is ready.${NC}"
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo -e "  Node Port  : ${BOLD}${NODE_PORT}${NC}"
+echo -e "  Public IP  : ${BOLD}${IPV4}${NC}"
+echo -e "  DNS Record : ${BOLD}${SUBDOMAIN} → ${IPV4}${NC}"
+echo ""
