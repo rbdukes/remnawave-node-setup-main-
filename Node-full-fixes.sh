@@ -521,31 +521,3 @@ else
     echo "⚠️  remnanode container not found — skipping restart"
 fi
 
-# Fix 6 — Final status
-echo ""
-echo "📋 Last 5 lines of remnanode logs:"
-docker logs remnanode --tail 5 2>&1 || echo "⚠️  Could not fetch logs"
-
-echo ""
-echo "✅ All fixes applied!"
-echo "💡 You can re-run these fixes anytime with: bash /root/node-fix.sh"
-FIXEOF
-
-    chmod +x /root/node-fix.sh
-    echo -e "${CYAN}Skipping post-install fixes.${NC}"
-    echo -e "${YELLOW}💡 You can apply them later by running: ${BOLD}bash /root/node-fix.sh${NC}"
-fi
-
-# ============================================================
-# --- DONE ---
-# ============================================================
-echo ""
-echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}  🎉 All done! Node is ready.${NC}"
-echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
-echo -e "  Node Port  : ${BOLD}${NODE_PORT}${NC}"
-echo -e "  Public IP  : ${BOLD}${IPV4}${NC}"
-echo -e "  DNS Record : ${BOLD}${SUBDOMAIN} → ${IPV4}${NC}"
-echo -e "  Fix Script : ${BOLD}/root/node-fix.sh${NC}"
-echo ""
