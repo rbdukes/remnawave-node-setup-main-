@@ -217,18 +217,47 @@ print_ok "Configuration created at /opt/remnanode/"
 # ============================================================
 # [6/7] START REMNANODE
 # ============================================================
-print_step "6/7" "Starting Remnawave Node"
+print_step "6/8" "Starting Remnawave Node"
 cd /opt/remnanode
-docker compose pull
-docker compose up -d
 
+# Check for docker compose
+DOCKER_COMPOSE_CMD=""
+if docker compose version &>/dev/null; then
+    DOCKER_COMPOSE_CMD="docker compose"
+elif command -v docker-compose &>/dev/null; then
+    DOCKER_COMPOSE_CMD="docker-compose"
+else
+    echo -e "${YELLOW}Docker Compose not found. Installing...${NC}"
+    apt update
+    apt install -y docker-compose || apt install -y docker-compose-plugin
+    
+    # Check again after installation
+    if docker compose version &>/dev/null; then
+        DOCKER_COMPOSE_CMD="docker compose"
+    elif command -v docker-compose &>/dev/null; then
+        DOCKER_COMPOSE_CMD="docker-compose"
+    else
+        print_err "Failed to install Docker Compose. Please install it manually."
+        exit 1
+    fi
+fi
+
+# Check if we can pull the image directly
+if ! $DOCKER_COMPOSE_CMD pull &>/dev/null; then
+    try_pull_from_mirrors || print_err "Failed to pull the image from mirrors too."
+fi
+
+# Start container
+$DOCKER_COMPOSE_CMD up -d
+
+# Wait and verify
 sleep 6
 if docker ps | grep -q "remnanode"; then
     print_ok "Remnawave Node is running"
-    docker compose logs --tail=15
+    $DOCKER_COMPOSE_CMD logs --tail=15
 else
     print_err "Container failed to start. Logs:"
-    docker compose logs --tail=30
+    $DOCKER_COMPOSE_CMD logs --tail=30
     exit 1
 fi
 
