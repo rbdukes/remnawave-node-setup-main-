@@ -1,3 +1,5 @@
+# Create the script file
+cat > remnawave-setup.sh << 'EOF'
 #!/bin/bash
 set -euo pipefail
 
@@ -354,9 +356,7 @@ WARP_TMP=$(mktemp -d)
 cd "$WARP_TMP"
 wgcf register --accept-tos
 wgcf generate
-print_ok "W# Step 6: Configure for full tunnel
-print_info "Configuring WARP profile..."
-sed -i 's|AllowedIPs = .*|AllowedIPs = 0.0.0.0/0|' wgcf-profile.conf
+print_ok "WARP configuration generated"
 
 # Step 6: Configure for full tunnel
 print_info "Configuring WARP profile..."
