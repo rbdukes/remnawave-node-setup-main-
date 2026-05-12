@@ -1,0 +1,410 @@
+#!/bin/bash
+set -euo pipefail
+
+# ============================================================
+#   Remnawave Node Setup Script
+#   heatfm.cc Infrastructure
+#   Full-proof version with WARP + SSH protection
+#   Includes all KZ + Turkey fixes
+# ============================================================
+
+# --- COLORS ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# --- DEFAULTS ---
+DEFAULT_NODE_PORT="3389"
+DEFAULT_PANEL_URL="https://panel.heatfm.cc"
+DEFAULT_DOMAIN_SUFFIX="heatfm.cc"
+
+# --- ROOT CHECK ---
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}❌ This script must be run as root. Use: sudo bash $0${NC}"
+    exit 1
+fi
+
+# --- OS CHECK ---
+if ! grep -qi "ubuntu\|debian" /etc/os-release 2>/dev/null; then
+    echo -e "${YELLOW}⚠️  Warning: This script is designed for Ubuntu/Debian. Proceed with caution.${NC}"
+    sleep 3
+fi
+
+clear
+echo -e "${CYAN}${BOLD}"
+echo "  ╔══════════════════════════════════════════╗"
+echo "  ║     Remnawave Node Setup Script          ║"
+echo "  ║     heatfm.cc Infrastructure            ║"
+echo "  ╚══════════════════════════════════════════╝"
+echo -e "${NC}"
+
+# ============================================================
+# --- GATHER INFO ---
+# ============================================================
+echo -e "${YELLOW}${BOLD}Step 1 — Node Information${NC}"
+echo ""
+
+# Country name
+while true; do
+    read -rp "$(echo -e "${BLUE}Enter country name [e.g. Netherlands, USA, Finland]: ${NC}")" COUNTRY
+    if [ -n "$COUNTRY" ]; then break; fi
+    echo -e "${RED}Country name is required!${NC}"
+done
+
+# Subdomain
+COUNTRY_LOWER=$(echo "$COUNTRY" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | sed 's/[^a-z0-9-]//g')
+DEFAULT_SUBDOMAIN="${COUNTRY_LOWER}.${DEFAULT_DOMAIN_SUFFIX}"
+read -rp "$(echo -e "${BLUE}Node subdomain [default: ${DEFAULT_SUBDOMAIN}]: ${NC}")" SUBDOMAIN
+SUBDOMAIN=${SUBDOMAIN:-$DEFAULT_SUBDOMAIN}
+
+# Node Port
+read -rp "$(echo -e "${BLUE}Node API port [default: ${DEFAULT_NODE_PORT}]: ${NC}")" NODE_PORT
+NODE_PORT=${NODE_PORT:-$DEFAULT_NODE_PORT}
+if ! [[ "$NODE_PORT" =~ ^[0-9]+$ ]] || [ "$NODE_PORT" -lt 1 ] || [ "$NODE_PORT" -gt 65535 ]; then
+    echo -e "${RED}Invalid port. Using default: ${DEFAULT_NODE_PORT}${NC}"
+    NODE_PORT=$DEFAULT_NODE_PORT
+fi
+
+# Panel URL
+read -rp "$(echo -e "${BLUE}Panel URL [default: ${DEFAULT_PANEL_URL}]: ${NC}")" PANEL_URL
+PANEL_URL=${PANEL_URL:-$DEFAULT_PANEL_URL}
+
+# Secret Key
+echo ""
+echo -e "${YELLOW}${BOLD}Step 2 — Secret Key${NC}"
+echo -e "${CYAN}Go to your Remnawave panel → Nodes → Add Node${NC}"
+echo -e "${CYAN}Fill in the node details and copy the SECRET_KEY${NC}"
+echo ""
+while true; do
+    read -rp "$(echo -e "${BLUE}Paste the SECRET_KEY from the panel: ${NC}")" SECRET_KEY
+    if [ -n "$SECRET_KEY" ]; then break; fi
+    echo -e "${RED}Secret key is required!${NC}"
+done
+
+# Confirm
+echo ""
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}${BOLD}  Setup Summary${NC}"
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "  Country    : ${BOLD}$COUNTRY${NC}"
+echo -e "  Subdomain  : ${BOLD}$SUBDOMAIN${NC}"
+echo -e "  Node Port  : ${BOLD}$NODE_PORT${NC}"
+echo -e "  Panel URL  : ${BOLD}$PANEL_URL${NC}"
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+read -rp "$(echo -e "${YELLOW}Proceed with installation? [y/N]: ${NC}")" CONFIRM
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo -e "${RED}Installation cancelled.${NC}"
+    exit 0
+fi
+
+# ============================================================
+# --- HELPERS ---
+# ============================================================
+print_step() { echo -e "\n${CYAN}${BOLD}[$1] $2...${NC}"; }
+print_ok()   { echo -e "${GREEN}✅ $1${NC}"; }
+print_err()  { echo -e "${RED}❌ $1${NC}"; }
+
+# ============================================================
+# [1/7] SYSTEM UPDATE
+# ============================================================
+print_step "1/7" "Updating system packages"
+
+echo -e "${YELLOW}Waiting for package manager to be available...${NC}"
+while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 2; done
+
+systemctl stop unattended-upgrades 2>/dev/null || true
+killall unattended-upgr 2>/dev/null || true
+rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
+dpkg --configure -a 2>/dev/null || true
+
+apt update -y
+DEBIAN_FRONTEND=noninteractive apt upgrade -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold"
+
+systemctl disable unattended-upgrades 2>/dev/null || true
+systemctl stop unattended-upgrades 2>/dev/null || true
+
+print_ok "System updated and auto-upgrades disabled"
+
+# ============================================================
+# [2/7] SET HOSTNAME + FIX /etc/hosts
+# ============================================================
+print_step "2/7" "Setting hostname"
+hostnamectl set-hostname "${COUNTRY_LOWER}-node"
+
+# FIX: Remove any 127.0.1.1 entries added by Ubuntu when setting hostname
+# These cause client connections to resolve to localhost instead of real IP
+sed -i '/127\.0\.1\.1/d' /etc/hosts
+# Also remove any stale subdomain entries
+sed -i "/${SUBDOMAIN}/d" /etc/hosts
+
+print_ok "Hostname set to: ${COUNTRY_LOWER}-node (/etc/hosts cleaned)"
+
+# ============================================================
+# [3/7] FIREWALL
+# ============================================================
+print_step "3/7" "Configuring firewall (UFW)"
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow "${NODE_PORT}"/tcp
+ufw allow 61000/tcp
+ufw --force enable
+ufw reload
+print_ok "Firewall configured (22, 80, 443, ${NODE_PORT}, 61000)"
+
+# ============================================================
+# [4/7] INSTALL DOCKER
+# ============================================================
+print_step "4/7" "Installing Docker"
+if command -v docker &>/dev/null; then
+    print_ok "Docker already installed ($(docker --version | cut -d' ' -f3 | tr -d ','))"
+else
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker
+    systemctl start docker
+    print_ok "Docker installed"
+fi
+
+if ! docker info &>/dev/null; then
+    print_err "Docker failed to start. Aborting."
+    exit 1
+fi
+
+# ============================================================
+# [5/7] CONFIGURE REMNANODE
+# ============================================================
+print_step "5/7" "Creating Remnawave Node configuration"
+mkdir -p /opt/remnanode
+
+cat > /opt/remnanode/.env << EOF
+### NODE ###
+NODE_PORT=${NODE_PORT}
+
+### XRAY ###
+SECRET_KEY=${SECRET_KEY}
+
+### Internal port
+XTLS_API_PORT=61000
+EOF
+
+cat > /opt/remnanode/docker-compose.yml << 'EOF'
+services:
+  remnanode:
+    container_name: remnanode
+    hostname: remnanode
+    image: ghcr.io/remnawave/node:latest
+    env_file:
+      - .env
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+EOF
+
+print_ok "Configuration created at /opt/remnanode/"
+
+# ============================================================
+# [6/7] START REMNANODE
+# ============================================================
+print_step "6/7" "Starting Remnawave Node"
+cd /opt/remnanode
+docker compose pull
+docker compose up -d
+
+sleep 6
+if docker ps | grep -q "remnanode"; then
+    print_ok "Remnawave Node is running"
+    docker compose logs --tail=15
+else
+    print_err "Container failed to start. Logs:"
+    docker compose logs --tail=30
+    exit 1
+fi
+
+# ============================================================
+# [7/7] GET PUBLIC IP
+# ============================================================
+print_step "7/7" "Detecting public IP"
+IPV4=$(curl -4 -s --max-time 10 ifconfig.me || curl -4 -s --max-time 10 api.ipify.org || echo "UNKNOWN")
+print_ok "Public IP: $IPV4"
+
+# ============================================================
+# --- SUMMARY ---
+# ============================================================
+echo ""
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}${BOLD}  ✅ Node Setup Complete!${NC}"
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo -e "${YELLOW}${BOLD}Next steps in the Remnawave Panel:${NC}"
+echo -e "  1. Go to ${BOLD}Nodes → Management${NC}"
+echo -e "  2. Find your new ${BOLD}$COUNTRY${NC} node"
+echo -e "  3. Click ${BOLD}Link Inbound${NC} → select ${BOLD}VLESS_TCP_REALITY${NC}"
+echo -e "  4. Go to ${BOLD}Hosts → Add Host${NC}:"
+echo -e "     - Remark   : 🌍 $COUNTRY"
+echo -e "     - Address  : $SUBDOMAIN"
+echo -e "     - Port     : 443"
+echo -e "     - Inbound  : VLESS_TCP_REALITY"
+echo -e "     - SNI      : ozon.ru"
+echo -e "     - FP       : chrome"
+echo -e "     - x25519   : ON"
+echo ""
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}DNS A Record to add:${NC}"
+echo -e "  ${BOLD}$SUBDOMAIN → $IPV4${NC}"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+
+# ============================================================
+# --- OPTIONAL: WARP ---
+# ============================================================
+echo ""
+read -rp "$(echo -e "${YELLOW}Do you want to install WARP (wg0) on this node now? [y/N]: ${NC}")" INSTALL_WARP
+
+if [[ "$INSTALL_WARP" =~ ^[Yy]$ ]]; then
+    echo ""
+    echo -e "${CYAN}${BOLD}[Bonus] Installing Cloudflare WARP with SSH protection...${NC}"
+
+    # 1. Install dependencies
+    apt install -y wireguard-tools curl iproute2 resolvconf >/dev/null 2>&1
+    print_ok "WireGuard tools installed"
+
+    # 2. Download latest wgcf
+    echo -e "${BLUE}  - Fetching latest wgcf version...${NC}"
+    WGCF_VER=$(curl -s https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+    if [ -z "$WGCF_VER" ]; then
+        WGCF_VER="v2.2.22"
+        echo -e "${YELLOW}  ⚠️  Could not fetch latest version, using fallback: ${WGCF_VER}${NC}"
+    fi
+    WGCF_VER_NUM="${WGCF_VER#v}"
+    wget -qO /usr/local/bin/wgcf "https://github.com/ViRb3/wgcf/releases/download/${WGCF_VER}/wgcf_${WGCF_VER_NUM}_linux_amd64"
+    chmod +x /usr/local/bin/wgcf
+    print_ok "wgcf ${WGCF_VER} installed"
+
+    # 3. Register and generate config
+    WARP_TMP=$(mktemp -d)
+    cd "$WARP_TMP"
+    echo -e "${BLUE}  - Registering WARP device...${NC}"
+    wgcf register --accept-tos 2>&1 | grep -v "GET" || true
+    echo -e "${BLUE}  - Generating WireGuard config...${NC}"
+    wgcf generate 2>&1 | grep -v "GET" || true
+
+    if [ ! -f wgcf-profile.conf ]; then
+        print_err "wgcf failed to generate config. Skipping WARP."
+        cd /
+        rm -rf "$WARP_TMP"
+    else
+        # 4. Detect gateway and interface automatically (works on any server)
+        GW=$(ip route show | grep default | awk '{print $3}' | head -1)
+        DEV=$(ip route show | grep default | awk '{print $5}' | head -1)
+        SERVER_IP=$(curl -4 -s --max-time 10 ifconfig.me || echo "$IPV4")
+
+        echo -e "${BLUE}  - Detected gateway: ${GW} on interface: ${DEV}${NC}"
+        echo -e "${BLUE}  - Server IP: ${SERVER_IP}${NC}"
+
+        # 5. Extract keys from generated config
+        PRIVKEY=$(grep PrivateKey wgcf-profile.conf | awk '{print $3}')
+        ADDRESS_V4=$(grep Address wgcf-profile.conf | head -1 | awk '{print $3}')
+        ADDRESS_V6=$(grep Address wgcf-profile.conf | grep ":" | awk '{print $3}' | head -1)
+
+        # 6. Add warp routing table if not present
+        grep -q "^100 warp" /etc/iproute2/rt_tables || echo "100 warp" >> /etc/iproute2/rt_tables
+
+        # 7. Write clean config with proven routing fix
+        #    Key fixes applied here:
+        #    - Static route to Cloudflare endpoint via real gateway (prevents tunnel loop)
+        #    - ip rule add to 162.159.192.1 lookup main (prevents handshake routing through wg0)
+        #    - Server IP excluded from WARP (SSH stays on real interface)
+        #    - Table = off (wg-quick does not touch default routes)
+        #    - || true on all rules (prevents PostUp failure killing the tunnel)
+        cat > /etc/wireguard/wg0.conf << EOF
+[Interface]
+PrivateKey = ${PRIVKEY}
+Address = ${ADDRESS_V4}
+$([ -n "${ADDRESS_V6}" ] && echo "Address = ${ADDRESS_V6}" || true)
+DNS = 1.1.1.1, 1.0.0.1
+MTU = 1280
+Table = off
+PostUp = ip route add 162.159.192.1 via ${GW} dev ${DEV} || true; ip route add default dev wg0 table warp || true; ip rule add to 162.159.192.1 lookup main priority 3000 || true; ip rule add from all lookup warp priority 5000 || true; ip rule add from ${SERVER_IP} lookup main priority 4000 || true
+PreDown = ip route del 162.159.192.1 via ${GW} dev ${DEV} || true; ip rule del priority 3000 || true; ip rule del priority 5000 || true; ip rule del priority 4000 || true; ip route flush table warp || true
+
+[Peer]
+PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 162.159.192.1:2408
+PersistentKeepalive = 25
+EOF
+
+        cd /
+        rm -rf "$WARP_TMP"
+        print_ok "WARP config deployed to /etc/wireguard/wg0.conf"
+
+        # 8. Enable and start WARP
+        systemctl enable wg-quick@wg0 >/dev/null 2>&1
+        systemctl start wg-quick@wg0
+        sleep 5
+
+        # 9. Restart wg-quick to ensure DNS resolves correctly (KZ fix)
+        systemctl restart wg-quick@wg0
+        sleep 3
+
+        # 10. Verify WARP is working
+        WARP_IP=$(curl -s --max-time 10 https://ipinfo.io/ip 2>/dev/null || echo "unknown")
+        WARP_ORG=$(curl -s --max-time 10 https://ipinfo.io/org 2>/dev/null || echo "unknown")
+
+        echo ""
+        if echo "$WARP_ORG" | grep -qi "cloudflare"; then
+            print_ok "WARP is working! Outbound IP: ${WARP_IP} (${WARP_ORG})"
+        else
+            echo -e "${YELLOW}⚠️  WARP started. Outbound IP: ${WARP_IP} — verify with: curl https://ipinfo.io/json${NC}"
+        fi
+
+        echo ""
+        echo -e "${CYAN}WARP status:${NC}"
+        wg show wg0 2>/dev/null || true
+        echo ""
+        echo -e "${GREEN}✅ SSH is protected — server IP ${SERVER_IP} stays on real interface.${NC}"
+        echo -e "${CYAN}Note: Make sure your XRay template has outbound pointing to \"interface\": \"wg0\"${NC}"
+    fi
+else
+    echo -e "${CYAN}Skipping WARP installation.${NC}"
+fi
+
+# ============================================================
+# --- POST-INSTALL FIXES (applied automatically) ---
+# ============================================================
+echo ""
+echo -e "${CYAN}${BOLD}[Post-install] Applying final fixes...${NC}"
+
+# Fix: Restart remnanode to ensure it picks up all network changes
+docker restart remnanode >/dev/null 2>&1
+sleep 5
+print_ok "Remnanode restarted with final config"
+
+# Fix: Confirm /etc/hosts is clean (double-check)
+sed -i '/127\.0\.1\.1/d' /etc/hosts
+print_ok "/etc/hosts verified clean"
+
+# ============================================================
+# --- DONE ---
+# ============================================================
+echo ""
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}  🎉 All done! Node is ready.${NC}"
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo -e "  Node Port  : ${BOLD}${NODE_PORT}${NC}"
+echo -e "  Public IP  : ${BOLD}${IPV4}${NC}"
+echo -e "  DNS Record : ${BOLD}${SUBDOMAIN} → ${IPV4}${NC}"
+echo ""
