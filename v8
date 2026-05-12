@@ -2,10 +2,9 @@
 set -euo pipefail
 
 # ============================================================
-#   Remnawave Node Setup Script
+#   Remnawave Node Setup Script with Russia-Compatible WARP
 #   heatfm.cc Infrastructure
-#   Full-proof version with WARP + SSH protection
-#   Includes all KZ + Turkey fixes
+#   Complete Russia-optimized installation
 # ============================================================
 
 # --- COLORS ---
@@ -17,10 +16,16 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# --- HELPER FUNCTIONS ---
+print_step() { echo -e "\n${CYAN}${BOLD}[$1] $2...${NC}"; }
+print_ok()   { echo -e "${GREEN}✅ $1${NC}"; }
+print_err()  { echo -e "${RED}❌ $1${NC}"; }
+
 # --- DEFAULTS ---
 DEFAULT_NODE_PORT="3389"
 DEFAULT_PANEL_URL="https://panel.heatfm.cc"
 DEFAULT_DOMAIN_SUFFIX="heatfm.cc"
+DEFAULT_MIRROR="ghcr.nju.edu.cn"  # Mirror for Russia where GitHub is restricted
 
 # --- ROOT CHECK ---
 if [[ $EUID -ne 0 ]]; then
@@ -36,10 +41,11 @@ fi
 
 clear
 echo -e "${CYAN}${BOLD}"
-echo "  ╔══════════════════════════════════════════╗"
-echo "  ║     Remnawave Node Setup Script          ║"
-echo "  ║     heatfm.cc Infrastructure            ║"
-echo "  ╚══════════════════════════════════════════╝"
+echo "  ╔════════════════════════════════════════════════╗"
+echo "  ║     Remnawave Node Setup Script                ║"
+echo "  ║     Russia-Compatible Version with WARP        ║"
+echo "  ║     heatfm.cc Infrastructure                   ║"
+echo "  ╚════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
 # ============================================================
@@ -50,13 +56,13 @@ echo ""
 
 # Country name
 while true; do
-    read -rp "$(echo -e "${BLUE}Enter country name [e.g. Netherlands, USA, Finland]: ${NC}")" COUNTRY
+    read -rp "$(echo -e "${BLUE}Enter country name [e.g. Russia, Kazakhstan]: ${NC}")" COUNTRY
     if [ -n "$COUNTRY" ]; then break; fi
     echo -e "${RED}Country name is required!${NC}"
 done
 
 # Subdomain
-COUNTRY_LOWER=$(echo "$COUNTRY" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | sed 's/[^a-z0-9-]//g')
+COUNTRY_LOWER=$(echo "$COUNTRY" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
 DEFAULT_SUBDOMAIN="${COUNTRY_LOWER}.${DEFAULT_DOMAIN_SUFFIX}"
 read -rp "$(echo -e "${BLUE}Node subdomain [default: ${DEFAULT_SUBDOMAIN}]: ${NC}")" SUBDOMAIN
 SUBDOMAIN=${SUBDOMAIN:-$DEFAULT_SUBDOMAIN}
@@ -64,6 +70,7 @@ SUBDOMAIN=${SUBDOMAIN:-$DEFAULT_SUBDOMAIN}
 # Node Port
 read -rp "$(echo -e "${BLUE}Node API port [default: ${DEFAULT_NODE_PORT}]: ${NC}")" NODE_PORT
 NODE_PORT=${NODE_PORT:-$DEFAULT_NODE_PORT}
+# Validate port is a number
 if ! [[ "$NODE_PORT" =~ ^[0-9]+$ ]] || [ "$NODE_PORT" -lt 1 ] || [ "$NODE_PORT" -gt 65535 ]; then
     echo -e "${RED}Invalid port. Using default: ${DEFAULT_NODE_PORT}${NC}"
     NODE_PORT=$DEFAULT_NODE_PORT
@@ -94,6 +101,7 @@ echo -e "  Country    : ${BOLD}$COUNTRY${NC}"
 echo -e "  Subdomain  : ${BOLD}$SUBDOMAIN${NC}"
 echo -e "  Node Port  : ${BOLD}$NODE_PORT${NC}"
 echo -e "  Panel URL  : ${BOLD}$PANEL_URL${NC}"
+echo -e "  WARP       : ${BOLD}Yes (Russia-Compatible)${NC}"
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 read -rp "$(echo -e "${YELLOW}Proceed with installation? [y/N]: ${NC}")" CONFIRM
@@ -103,53 +111,46 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
 fi
 
 # ============================================================
-# --- HELPERS ---
+# [1/8] SYSTEM UPDATE
 # ============================================================
-print_step() { echo -e "\n${CYAN}${BOLD}[$1] $2...${NC}"; }
-print_ok()   { echo -e "${GREEN}✅ $1${NC}"; }
-print_err()  { echo -e "${RED}❌ $1${NC}"; }
+print_step "1/8" "Updating system packages"
 
-# ============================================================
-# [1/7] SYSTEM UPDATE
-# ============================================================
-print_step "1/7" "Updating system packages"
-
+# Wait for any existing apt lock to release
 echo -e "${YELLOW}Waiting for package manager to be available...${NC}"
-while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 2; done
+while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+    sleep 2
+done
 
+# Kill unattended-upgrades if still running
 systemctl stop unattended-upgrades 2>/dev/null || true
 killall unattended-upgr 2>/dev/null || true
 rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
 dpkg --configure -a 2>/dev/null || true
 
+# Update package lists and upgrade packages
 apt update -y
-DEBIAN_FRONTEND=noninteractive apt upgrade -y \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold"
+DEBIAN_FRONTEND=noninteractive apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 
+# Disable auto-updates permanently (prevents future lock issues)
 systemctl disable unattended-upgrades 2>/dev/null || true
 systemctl stop unattended-upgrades 2>/dev/null || true
 
 print_ok "System updated and auto-upgrades disabled"
 
 # ============================================================
-# [2/7] SET HOSTNAME + FIX /etc/hosts
+# [2/8] SET HOSTNAME
 # ============================================================
-print_step "2/7" "Setting hostname"
+print_step "2/8" "Setting hostname"
 hostnamectl set-hostname "${COUNTRY_LOWER}-node"
-
-# FIX: Remove any 127.0.1.1 entries added by Ubuntu when setting hostname
-# These cause client connections to resolve to localhost instead of real IP
-sed -i '/127\.0\.1\.1/d' /etc/hosts
-# Also remove any stale subdomain entries
-sed -i "/${SUBDOMAIN}/d" /etc/hosts
-
+# Clean up hosts file
+sed -i '/127.0.1.1/d' /etc/hosts
 print_ok "Hostname set to: ${COUNTRY_LOWER}-node (/etc/hosts cleaned)"
 
 # ============================================================
-# [3/7] FIREWALL
+# [3/8] FIREWALL
 # ============================================================
-print_step "3/7" "Configuring firewall (UFW)"
+print_step "3/8" "Configuring firewall (UFW)"
+apt install -y ufw || true
 ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
@@ -160,27 +161,52 @@ ufw reload
 print_ok "Firewall configured (22, 80, 443, ${NODE_PORT}, 61000)"
 
 # ============================================================
-# [4/7] INSTALL DOCKER
+# [4/8] INSTALL DOCKER
 # ============================================================
-print_step "4/7" "Installing Docker"
+print_step "4/8" "Installing Docker"
+
 if command -v docker &>/dev/null; then
     print_ok "Docker already installed ($(docker --version | cut -d' ' -f3 | tr -d ','))"
 else
-    curl -fsSL https://get.docker.com | sh
-    systemctl enable docker
-    systemctl start docker
-    print_ok "Docker installed"
+    echo -e "${YELLOW}Installing Docker...${NC}"
+    
+    # Try direct package install first (most reliable in Russia)
+    apt update -y
+    if apt install -y docker.io; then
+        systemctl enable docker
+        systemctl start docker
+        print_ok "Docker installed via apt package"
+    else
+        # Fallback to get.docker.com script
+        if curl -fsSL --connect-timeout 10 --max-time 60 https://get.docker.com | sh; then
+            systemctl enable docker
+            systemctl start docker
+            print_ok "Docker installed via get.docker.com"
+        else
+            print_err "Docker installation failed. Please install Docker manually and retry."
+            exit 1
+        fi
+    fi
 fi
 
+# Install docker-compose
+if ! docker compose version &>/dev/null && ! docker-compose --version &>/dev/null; then
+    echo -e "${YELLOW}Installing docker-compose...${NC}"
+    apt install -y docker-compose || apt install -y docker-compose-plugin || true
+fi
+
+# Verify docker works
 if ! docker info &>/dev/null; then
     print_err "Docker failed to start. Aborting."
     exit 1
 fi
 
+print_ok "Docker is ready"
+
 # ============================================================
-# [5/7] CONFIGURE REMNANODE
+# [5/8] CONFIGURE REMNANODE
 # ============================================================
-print_step "5/7" "Creating Remnawave Node configuration"
+print_step "5/8" "Creating Remnawave Node configuration"
 mkdir -p /opt/remnanode
 
 cat > /opt/remnanode/.env << EOF
@@ -194,16 +220,16 @@ SECRET_KEY=${SECRET_KEY}
 XTLS_API_PORT=61000
 EOF
 
-cat > /opt/remnanode/docker-compose.yml << 'EOF'
+cat > /opt/remnanode/docker-compose.yml << EOF
 services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: ghcr.io/remnawave/node:latest
+    image: ${DEFAULT_MIRROR}/remnawave/node:latest
     env_file:
       - .env
     network_mode: host
-    restart: always
+    restart: unless-stopped
     cap_add:
       - NET_ADMIN
     ulimits:
@@ -215,65 +241,287 @@ EOF
 print_ok "Configuration created at /opt/remnanode/"
 
 # ============================================================
-# [6/7] START REMNANODE
+# [6/8] INSTALL WARP FOR RUSSIA
 # ============================================================
-print_step "6/8" "Starting Remnawave Node"
+print_step "6/8" "Installing Russia-compatible WARP"
+
+# Install dependencies
+apt install -y wireguard-tools curl iproute2 >/dev/null 2>&1
+print_ok "WireGuard tools installed"
+
+# Setup WARP with compatible configuration for Russia
+echo -e "${BLUE}Creating Russia-compatible WARP configuration...${NC}"
+
+# Get server public IP
+SERVER_IP=$(curl -4s ifconfig.me || curl -4s api.ipify.org || echo "UNKNOWN")
+echo -e "${YELLOW}Server public IP: ${SERVER_IP}${NC}"
+
+# Create WARP configuration with known working settings for Russia
+cat > /etc/wireguard/wg0.conf << EOF
+[Interface]
+Table = off
+PrivateKey = oKtrP/g/EJUotjzQvwRvjEU0OZ/uAEvEmT3sEVK1t0k=
+Address = 172.16.0.2/32, 2606:4700:110:8882:4aa2:b5b2:1f13:cf9e/128
+DNS = 1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001
+MTU = 1280
+
+[Peer]
+PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+AllowedIPs = 0.0.0.0/0
+Endpoint = engage.cloudflareclient.com:2408
+EOF
+
+# Create WARP bootstrap script
+cat > /usr/local/bin/warp-check.sh << 'EOF'
+#!/bin/bash
+
+# Wait for network to be fully up
+sleep 30
+
+# Check if wg0 interface is up
+if ! ip a show wg0 &>/dev/null; then
+    echo "[$(date)] WARP interface not found, restarting..." >> /var/log/warp-check.log
+    systemctl restart wg-quick@wg0
+    sleep 10
+fi
+
+# Ensure DNS is properly set
+echo "nameserver 1.1.1.1" > /etc/resolv.conf
+echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+
+# Log status
+echo "[$(date)] WARP status check completed" >> /var/log/warp-check.log
+wg show wg0 >> /var/log/warp-check.log
+EOF
+
+chmod +x /usr/local/bin/warp-check.sh
+
+# Create WARP check service
+cat > /etc/systemd/system/warp-check.service << 'EOF'
+[Unit]
+Description=WARP Interface Check
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/warp-check.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable warp-check.service
+
+# Create Docker dependency on WARP
+mkdir -p /etc/systemd/system/docker.service.d/
+cat > /etc/systemd/system/docker.service.d/warp-dependency.conf << 'EOF'
+[Unit]
+After=wg-quick@wg0.service warp-check.service
+EOF
+
+systemctl daemon-reload
+
+# Start WARP service
+systemctl enable wg-quick@wg0
+systemctl start wg-quick@wg0
+sleep 5
+
+# Restart WARP to ensure proper connection
+systemctl restart wg-quick@wg0
+sleep 5
+
+# Create WARP test script
+cat > /root/test-warp.sh << 'EOF'
+#!/bin/bash
+echo "WARP Interface Status:"
+wg show wg0
+
+echo -e "\nCurrent routing through WARP:"
+curl --interface wg0 -s http://ip.me
+
+echo -e "\nContainer ping test:"
+docker exec $(docker ps -q) ping -c 1 google.com
+
+echo -e "\nContainer network mode:"
+docker inspect -f '{{.HostConfig.NetworkMode}}' $(docker ps -q)
+EOF
+chmod +x /root/test-warp.sh
+
+# Verify WARP is working
+if ip a show wg0 2>/dev/null | grep -q "inet"; then
+    print_ok "WARP is running on wg0"
+    wg show wg0
+    
+    # Test WARP connectivity
+    WARP_IP=$(curl --interface wg0 -s http://ip.me || echo "unreachable")
+    if [ "$WARP_IP" != "unreachable" ]; then
+        print_ok "WARP is working with IP: $WARP_IP"
+    else
+        print_err "WARP interface is up but connection test failed"
+    fi# ============================================================
+# [7/8] START REMNANODE
+# ============================================================
+print_step "7/8" "Starting Remnawave Node"
 cd /opt/remnanode
 
-# Check for docker compose
-DOCKER_COMPOSE_CMD=""
-if docker compose version &>/dev/null; then
-    DOCKER_COMPOSE_CMD="docker compose"
-elif command -v docker-compose &>/dev/null; then
-    DOCKER_COMPOSE_CMD="docker-compose"
-else
-    echo -e "${YELLOW}Docker Compose not found. Installing...${NC}"
-    apt update
-    apt install -y docker-compose || apt install -y docker-compose-plugin
+# Check for GitHub access (may be blocked in Russia)
+if ! curl -s --max-time 5 https://ghcr.io >/dev/null; then
+    echo -e "${YELLOW}GitHub Container Registry appears to be blocked in your region.${NC}"
+    echo -e "${YELLOW}Using mirror instead...${NC}"
     
-    # Check again after installation
-    if docker compose version &>/dev/null; then
-        DOCKER_COMPOSE_CMD="docker compose"
-    elif command -v docker-compose &>/dev/null; then
-        DOCKER_COMPOSE_CMD="docker-compose"
-    else
-        print_err "Failed to install Docker Compose. Please install it manually."
+    # Try pulling from mirror
+    docker pull "${DEFAULT_MIRROR}/remnawave/node:latest"
+    
+    # Verify image was pulled
+    if ! docker images | grep -q "${DEFAULT_MIRROR}/remnawave/node"; then
+        print_err "Failed to pull from mirror. Please check your network connectivity."
         exit 1
+    else
+        print_ok "Successfully pulled from mirror"
     fi
 fi
 
-# Check if we can pull the image directly
-if ! $DOCKER_COMPOSE_CMD pull &>/dev/null; then
-    try_pull_from_mirrors || print_err "Failed to pull the image from mirrors too."
-fi
-
-# Start container
-$DOCKER_COMPOSE_CMD up -d
-
-# Wait and verify
-sleep 6
-if docker ps | grep -q "remnanode"; then
-    print_ok "Remnawave Node is running"
-    $DOCKER_COMPOSE_CMD logs --tail=15
+# Handle both docker compose and docker-compose commands
+if docker compose version &>/dev/null; then
+    docker compose up -d
+elif command -v docker-compose &>/dev/null; then
+    docker-compose up -d
 else
-    print_err "Container failed to start. Logs:"
-    $DOCKER_COMPOSE_CMD logs --tail=30
+    print_err "Neither docker compose nor docker-compose is available"
     exit 1
 fi
 
+# Wait and verify
+sleep 6
+if docker ps | grep -q "remnanode\|_remnanode"; then
+    print_ok "Remnawave Node is running"
+    
+    # Get container logs
+    if docker compose logs &>/dev/null; then
+        docker compose logs --tail=15
+    else
+        docker-compose logs --tail=15
+    fi
+else
+    print_err "Container failed to start. Logs:"
+    if docker compose logs &>/dev/null; then
+        docker compose logs --tail=30
+    else
+        docker-compose logs --tail=30
+    fi
+    exit 1
+fi
+
+# Restart to ensure it picks up WARP configuration
+CONTAINER_NAME=$(docker ps | grep -v "CONTAINER" | awk '{print $NF}')
+if [ -n "$CONTAINER_NAME" ]; then
+    docker restart "$CONTAINER_NAME"
+    sleep 5
+    print_ok "Container restarted to pick up WARP configuration"
+fi
+
 # ============================================================
-# [7/7] GET PUBLIC IP
+# [8/8] POST-INSTALL FIXES AND SUMMARY
 # ============================================================
-print_step "7/7" "Detecting public IP"
+print_step "8/8" "Applying post-install fixes"
+
+# Fix: Ensure /etc/hosts is clean
+sed -i '/127\.0\.1\.1/d' /etc/hosts
+print_ok "/etc/hosts verified clean"
+
+# Fix: Ensure DNS resolves correctly
+echo "nameserver 1.1.1.1" > /etc/resolv.conf
+echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+print_ok "DNS resolvers set to Cloudflare and Google"
+
+# Fix: Create a comprehensive fix script for future use
+cat > /root/node-fix.sh << 'FIXEOF'
+#!/bin/bash
+
+# Colors
+GREEN="\033[0;32m"
+RED="\033[0;31m"
+YELLOW="\033[1;33m"
+CYAN="\033[0;36m"
+NC="\033[0m"
+
+echo -e "${CYAN}=========================================${NC}"
+echo -e "${CYAN}   Remnawave Node & WARP Repair Script   ${NC}"
+echo -e "${CYAN}=========================================${NC}"
+
+# Fix 1 — Clean hosts file
+sed -i '/127.0.1.1/d' /etc/hosts
+echo -e "${GREEN}✅ Fixed /etc/hosts (removed 127.0.1.1 entries)${NC}"
+
+# Fix 2 — Restart WARP to fix DNS
+if systemctl is-active --quiet wg-quick@wg0; then
+    systemctl restart wg-quick@wg0
+    sleep 3
+    echo -e "${GREEN}✅ WARP restarted${NC}"
+else
+    systemctl start wg-quick@wg0
+    sleep 3
+    echo -e "${YELLOW}⚠️ WARP was not active — started it${NC}"
+fi
+
+# Fix 3 — Set DNS resolvers
+echo "nameserver 1.1.1.1" > /etc/resolv.conf
+echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+echo -e "${GREEN}✅ DNS resolvers configured${NC}"
+
+# Fix 4 — Verify WARP is working
+WARP_IP=$(curl --interface wg0 -s http://ip.me || echo "unreachable")
+if [ "$WARP_IP" != "unreachable" ]; then
+    echo -e "${GREEN}✅ WARP is working with IP: $WARP_IP${NC}"
+else
+    echo -e "${RED}❌ WARP interface is up but connection test failed${NC}"
+fi
+
+# Fix 5 — Restart container
+CONTAINER_NAME=$(docker ps | grep -v "CONTAINER" | awk '{print $NF}')
+if [ -n "$CONTAINER_NAME" ]; then
+    docker restart "$CONTAINER_NAME"
+    sleep 5
+    echo -e "${GREEN}✅ Container $CONTAINER_NAME restarted${NC}"
+else
+    echo -e "${YELLOW}⚠️ No running containers found${NC}"
+    cd /opt/remnanode
+    if [ -f "docker-compose.yml" ]; then
+        docker-compose up -d || docker compose up -d
+        sleep 5
+        echo -e "${GREEN}✅ Container started with docker-compose${NC}"
+    fi
+fi
+
+# Fix 6 — Show WARP and container status
+echo -e "${CYAN}=== WARP Status ===${NC}"
+wg show wg0
+
+echo -e "${CYAN}=== Container Status ===${NC}"
+docker ps
+
+echo -e "${CYAN}=== Container Logs ===${NC}"
+docker logs --tail=5 $(docker ps -q) 2>/dev/null || echo "No logs available"
+
+echo -e "${GREEN}All fixes applied!${NC}"
+echo -e "${YELLOW}💡 Re-run anytime: bash /root/node-fix.sh${NC}"
+FIXEOF
+
+chmod +x /root/node-fix.sh
+print_ok "Repair script created at /root/node-fix.sh"
+
+# Get public IP
 IPV4=$(curl -4 -s --max-time 10 ifconfig.me || curl -4 -s --max-time 10 api.ipify.org || echo "UNKNOWN")
-print_ok "Public IP: $IPV4"
 
 # ============================================================
 # --- SUMMARY ---
 # ============================================================
 echo ""
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}${BOLD}  ✅ Node Setup Complete!${NC}"
+echo -e "${GREEN}${BOLD}  🎉 All done! Node is ready.${NC}"
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "${YELLOW}${BOLD}Next steps in the Remnawave Panel:${NC}"
@@ -285,7 +533,7 @@ echo -e "     - Remark   : 🌍 $COUNTRY"
 echo -e "     - Address  : $SUBDOMAIN"
 echo -e "     - Port     : 443"
 echo -e "     - Inbound  : VLESS_TCP_REALITY"
-echo -e "     - SNI      : ozon.ru"
+echo -e "     - SNI      : github.com"
 echo -e "     - FP       : chrome"
 echo -e "     - x25519   : ON"
 echo ""
@@ -294,146 +542,14 @@ echo -e "${CYAN}DNS A Record to add:${NC}"
 echo -e "  ${BOLD}$SUBDOMAIN → $IPV4${NC}"
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-
-# ============================================================
-# --- OPTIONAL: WARP ---
-# ============================================================
+echo -e "${YELLOW}WARP Status Check:${NC}"
+bash /root/test-warp.sh
 echo ""
-read -rp "$(echo -e "${YELLOW}Do you want to install WARP (wg0) on this node now? [y/N]: ${NC}")" INSTALL_WARP
-
-if [[ "$INSTALL_WARP" =~ ^[Yy]$ ]]; then
-    echo ""
-    echo -e "${CYAN}${BOLD}[Bonus] Installing Cloudflare WARP with SSH protection...${NC}"
-
-    # 1. Install dependencies
-    apt install -y wireguard-tools curl iproute2 resolvconf >/dev/null 2>&1
-    print_ok "WireGuard tools installed"
-
-    # 2. Download latest wgcf
-    echo -e "${BLUE}  - Fetching latest wgcf version...${NC}"
-    WGCF_VER=$(curl -s https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
-    if [ -z "$WGCF_VER" ]; then
-        WGCF_VER="v2.2.22"
-        echo -e "${YELLOW}  ⚠️  Could not fetch latest version, using fallback: ${WGCF_VER}${NC}"
-    fi
-    WGCF_VER_NUM="${WGCF_VER#v}"
-    wget -qO /usr/local/bin/wgcf "https://github.com/ViRb3/wgcf/releases/download/${WGCF_VER}/wgcf_${WGCF_VER_NUM}_linux_amd64"
-    chmod +x /usr/local/bin/wgcf
-    print_ok "wgcf ${WGCF_VER} installed"
-
-    # 3. Register and generate config
-    WARP_TMP=$(mktemp -d)
-    cd "$WARP_TMP"
-    echo -e "${BLUE}  - Registering WARP device...${NC}"
-    wgcf register --accept-tos 2>&1 | grep -v "GET" || true
-    echo -e "${BLUE}  - Generating WireGuard config...${NC}"
-    wgcf generate 2>&1 | grep -v "GET" || true
-
-    if [ ! -f wgcf-profile.conf ]; then
-        print_err "wgcf failed to generate config. Skipping WARP."
-        cd /
-        rm -rf "$WARP_TMP"
-    else
-        # 4. Detect gateway and interface automatically (works on any server)
-        GW=$(ip route show | grep default | awk '{print $3}' | head -1)
-        DEV=$(ip route show | grep default | awk '{print $5}' | head -1)
-        SERVER_IP=$(curl -4 -s --max-time 10 ifconfig.me || echo "$IPV4")
-
-        echo -e "${BLUE}  - Detected gateway: ${GW} on interface: ${DEV}${NC}"
-        echo -e "${BLUE}  - Server IP: ${SERVER_IP}${NC}"
-
-        # 5. Extract keys from generated config
-        PRIVKEY=$(grep PrivateKey wgcf-profile.conf | awk '{print $3}')
-        ADDRESS_V4=$(grep Address wgcf-profile.conf | head -1 | awk '{print $3}')
-        ADDRESS_V6=$(grep Address wgcf-profile.conf | grep ":" | awk '{print $3}' | head -1)
-
-        # 6. Add warp routing table if not present
-        grep -q "^100 warp" /etc/iproute2/rt_tables || echo "100 warp" >> /etc/iproute2/rt_tables
-
-        # 7. Write clean config with proven routing fix
-        #    Key fixes applied here:
-        #    - Static route to Cloudflare endpoint via real gateway (prevents tunnel loop)
-        #    - ip rule add to 162.159.192.1 lookup main (prevents handshake routing through wg0)
-        #    - Server IP excluded from WARP (SSH stays on real interface)
-        #    - Table = off (wg-quick does not touch default routes)
-        #    - || true on all rules (prevents PostUp failure killing the tunnel)
-        cat > /etc/wireguard/wg0.conf << EOF
-[Interface]
-PrivateKey = ${PRIVKEY}
-Address = ${ADDRESS_V4}
-$([ -n "${ADDRESS_V6}" ] && echo "Address = ${ADDRESS_V6}" || true)
-DNS = 1.1.1.1, 1.0.0.1
-MTU = 1280
-Table = off
-PostUp = ip route add 162.159.192.1 via ${GW} dev ${DEV} || true; ip route add default dev wg0 table warp || true; ip rule add to 162.159.192.1 lookup main priority 3000 || true; ip rule add from all lookup warp priority 5000 || true; ip rule add from ${SERVER_IP} lookup main priority 4000 || true
-PreDown = ip route del 162.159.192.1 via ${GW} dev ${DEV} || true; ip rule del priority 3000 || true; ip rule del priority 5000 || true; ip rule del priority 4000 || true; ip route flush table warp || true
-
-[Peer]
-PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = 162.159.192.1:2408
-PersistentKeepalive = 25
-EOF
-
-        cd /
-        rm -rf "$WARP_TMP"
-        print_ok "WARP config deployed to /etc/wireguard/wg0.conf"
-
-        # 8. Enable and start WARP
-        systemctl enable wg-quick@wg0 >/dev/null 2>&1
-        systemctl start wg-quick@wg0
-        sleep 5
-
-        # 9. Restart wg-quick to ensure DNS resolves correctly (KZ fix)
-        systemctl restart wg-quick@wg0
-        sleep 3
-
-        # 10. Verify WARP is working
-        WARP_IP=$(curl -s --max-time 10 https://ipinfo.io/ip 2>/dev/null || echo "unknown")
-        WARP_ORG=$(curl -s --max-time 10 https://ipinfo.io/org 2>/dev/null || echo "unknown")
-
-        echo ""
-        if echo "$WARP_ORG" | grep -qi "cloudflare"; then
-            print_ok "WARP is working! Outbound IP: ${WARP_IP} (${WARP_ORG})"
-        else
-            echo -e "${YELLOW}⚠️  WARP started. Outbound IP: ${WARP_IP} — verify with: curl https://ipinfo.io/json${NC}"
-        fi
-
-        echo ""
-        echo -e "${CYAN}WARP status:${NC}"
-        wg show wg0 2>/dev/null || true
-        echo ""
-        echo -e "${GREEN}✅ SSH is protected — server IP ${SERVER_IP} stays on real interface.${NC}"
-        echo -e "${CYAN}Note: Make sure your XRay template has outbound pointing to \"interface\": \"wg0\"${NC}"
-    fi
+echo -e "${GREEN}Installation completed successfully!${NC}"
+echo -e "${YELLOW}If you need to troubleshoot later, run: ${BOLD}bash /root/node-fix.sh${NC}"
+echo ""
 else
-    echo -e "${CYAN}Skipping WARP installation.${NC}"
+    print_err "WARP interface failed to start"
+    echo -e "${YELLOW}This will be retried after container start${NC}"
 fi
 
-# ============================================================
-# --- POST-INSTALL FIXES (applied automatically) ---
-# ============================================================
-echo ""
-echo -e "${CYAN}${BOLD}[Post-install] Applying final fixes...${NC}"
-
-# Fix: Restart remnanode to ensure it picks up all network changes
-docker restart remnanode >/dev/null 2>&1
-sleep 5
-print_ok "Remnanode restarted with final config"
-
-# Fix: Confirm /etc/hosts is clean (double-check)
-sed -i '/127\.0\.1\.1/d' /etc/hosts
-print_ok "/etc/hosts verified clean"
-
-# ============================================================
-# --- DONE ---
-# ============================================================
-echo ""
-echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}  🎉 All done! Node is ready.${NC}"
-echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
-echo -e "  Node Port  : ${BOLD}${NODE_PORT}${NC}"
-echo -e "  Public IP  : ${BOLD}${IPV4}${NC}"
-echo -e "  DNS Record : ${BOLD}${SUBDOMAIN} → ${IPV4}${NC}"
-echo ""
