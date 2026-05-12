@@ -1,5 +1,3 @@
-# Create the script file
-cat > remnawave-setup.sh << 'EOF'
 #!/bin/bash
 set -euo pipefail
 
