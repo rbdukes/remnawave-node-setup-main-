@@ -343,10 +343,10 @@ echo -e "\nCurrent routing through WARP:"
 curl --interface wg0 -s http://ip.me
 
 echo -e "\nContainer ping test:"
-docker exec $(docker ps -q) ping -c 1 google.com
+docker exec $(docker ps -q 2>/dev/null || echo "") ping -c 1 google.com 2>/dev/null || echo "No container running yet"
 
 echo -e "\nContainer network mode:"
-docker inspect -f '{{.HostConfig.NetworkMode}}' $(docker ps -q)
+docker inspect -f '{{.HostConfig.NetworkMode}}' $(docker ps -q 2>/dev/null || echo "") 2>/dev/null || echo "No container running yet"
 EOF
 chmod +x /root/test-warp.sh
 
@@ -360,8 +360,14 @@ if ip a show wg0 2>/dev/null | grep -q "inet"; then
     if [ "$WARP_IP" != "unreachable" ]; then
         print_ok "WARP is working with IP: $WARP_IP"
     else
-        print_err "WARP interface is up but connection test failed"
-    fi# ============================================================
+        echo -e "${YELLOW}WARP interface is up but connection test failed${NC}"
+        echo -e "${YELLOW}This will be retried after container start${NC}"
+    fi
+else
+    echo -e "${YELLOW}WARP interface didn't start immediately${NC}"
+    echo -e "${YELLOW}This will be retried after container start${NC}"
+fi
+# ============================================================
 # [7/8] START REMNANODE
 # ============================================================
 print_step "7/8" "Starting Remnawave Node"
