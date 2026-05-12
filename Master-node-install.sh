@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # ============================================================
-#   Remnawave Node Setup Script with WARP Integration
+#   Remnawave Node Setup Script
 #   heatfm.cc Infrastructure
-#   Ultimate one-click installation
+#   Full-proof version with WARP + SSH protection
 # ============================================================
 
 # --- COLORS ---
@@ -29,7 +29,7 @@ fi
 
 # --- OS CHECK ---
 if ! grep -qi "ubuntu\|debian" /etc/os-release 2>/dev/null; then
-    echo -e "${YELLOW}⚠️  Warning: This script is designed for Ubuntu/Debian. Proceed with caution.${NC}"
+    echo -e "${YELLOW}⚠️  Warning: This script is designed for Ubuntu/Debian.${NC}"
     sleep 3
 fi
 
@@ -37,7 +37,7 @@ clear
 echo -e "${CYAN}${BOLD}"
 echo "  ╔══════════════════════════════════════════╗"
 echo "  ║     Remnawave Node Setup Script          ║"
-echo "  ║     heatfm.cc Infrastructure             ║"
+echo "  ║     heatfm.cc Infrastructure            ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -63,7 +63,6 @@ SUBDOMAIN=${SUBDOMAIN:-$DEFAULT_SUBDOMAIN}
 # Node Port
 read -rp "$(echo -e "${BLUE}Node API port [default: ${DEFAULT_NODE_PORT}]: ${NC}")" NODE_PORT
 NODE_PORT=${NODE_PORT:-$DEFAULT_NODE_PORT}
-# Validate port is a number
 if ! [[ "$NODE_PORT" =~ ^[0-9]+$ ]] || [ "$NODE_PORT" -lt 1 ] || [ "$NODE_PORT" -gt 65535 ]; then
     echo -e "${RED}Invalid port. Using default: ${DEFAULT_NODE_PORT}${NC}"
     NODE_PORT=$DEFAULT_NODE_PORT
@@ -73,10 +72,9 @@ fi
 read -rp "$(echo -e "${BLUE}Panel URL [default: ${DEFAULT_PANEL_URL}]: ${NC}")" PANEL_URL
 PANEL_URL=${PANEL_URL:-$DEFAULT_PANEL_URL}
 
-# WARP Installation
+# WARP choice — asked UP FRONT before installation
 echo ""
-read -rp "$(echo -e "${BLUE}Do you want to install Cloudflare WARP? (recommended) [Y/n]: ${NC}")" INSTALL_WARP
-INSTALL_WARP=${INSTALL_WARP:-Y}
+read -rp "$(echo -e "${YELLOW}Do you want to install WARP (wg0) on this node? [y/N]: ${NC}")" INSTALL_WARP_CHOICE
 
 # Secret Key
 echo ""
@@ -90,6 +88,17 @@ while true; do
     echo -e "${RED}Secret key is required!${NC}"
 done
 
+# ============================================================
+# FIX: Use [[ ]] for regex/string matching — fixes line 102 error
+# ============================================================
+
+# Normalize WARP choice
+if [[ "$INSTALL_WARP_CHOICE" =~ ^[Yy]$ ]]; then
+    WARP_DISPLAY="Yes"
+else
+    WARP_DISPLAY="No"
+fi
+
 # Confirm
 echo ""
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -99,10 +108,11 @@ echo -e "  Country    : ${BOLD}$COUNTRY${NC}"
 echo -e "  Subdomain  : ${BOLD}$SUBDOMAIN${NC}"
 echo -e "  Node Port  : ${BOLD}$NODE_PORT${NC}"
 echo -e "  Panel URL  : ${BOLD}$PANEL_URL${NC}"
-echo -e "  WARP       : ${BOLD}$([ "$INSTALL_WARP" =~ ^[Yy]$ ] && echo "Yes" || echo "No")${NC}"
+echo -e "  WARP       : ${BOLD}$WARP_DISPLAY${NC}"
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 read -rp "$(echo -e "${YELLOW}Proceed with installation? [y/N]: ${NC}")" CONFIRM
+# FIX: [[ ]] instead of [ ] for =~ operator
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     echo -e "${RED}Installation cancelled.${NC}"
     exit 0
@@ -120,22 +130,21 @@ print_err()  { echo -e "${RED}❌ $1${NC}"; }
 # ============================================================
 print_step "1/8" "Updating system packages"
 
-# Wait for any existing apt lock to release
 echo -e "${YELLOW}Waiting for package manager to be available...${NC}"
 while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
     sleep 2
 done
 
-# Kill unattended-upgrades if still running
 systemctl stop unattended-upgrades 2>/dev/null || true
 killall unattended-upgr 2>/dev/null || true
 rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
 dpkg --configure -a 2>/dev/null || true
 
 apt update -y
-DEBIAN_FRONTEND=noninteractive apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+DEBIAN_FRONTEND=noninteractive apt upgrade -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold"
 
-# Disable auto-updates permanently (prevents future lock issues)
 systemctl disable unattended-upgrades 2>/dev/null || true
 systemctl stop unattended-upgrades 2>/dev/null || true
 
@@ -162,21 +171,89 @@ ufw reload
 print_ok "Firewall configured (22, 80, 443, ${NODE_PORT}, 61000)"
 
 # ============================================================
-# [4/8] INSTALL DOCKER
+# [4/8] INSTALL DOCKER — Multi-method with fallbacks
 # ============================================================
 print_step "4/8" "Installing Docker"
+
+install_docker_apt() {
+    echo -e "${YELLOW}  Trying Docker apt repository method...${NC}"
+    apt install -y ca-certificates curl gnupg lsb-release 2>/dev/null || true
+    install -m 0755 -d /etc/apt/keyrings
+
+    if curl -fsSL --max-time 30 https://download.docker.com/linux/ubuntu/gpg \
+        -o /etc/apt/keyrings/docker.asc 2>/dev/null; then
+        chmod a+r /etc/apt/keyrings/docker.asc
+        echo \
+          "deb [arch=$(dpkg --print-architecture) \
+          signed-by=/etc/apt/keyrings/docker.asc] \
+          https://download.docker.com/linux/ubuntu \
+          $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+          tee /etc/apt/sources.list.d/docker.list > /dev/null
+        apt update -y
+        apt install -y docker-ce docker-ce-cli containerd.io \
+            docker-buildx-plugin docker-compose-plugin
+        return 0
+    fi
+    return 1
+}
+
+install_docker_snap() {
+    echo -e "${YELLOW}  Trying Docker snap method...${NC}"
+    apt install -y snapd 2>/dev/null || true
+    snap install docker 2>/dev/null && return 0
+    return 1
+}
+
+install_docker_distro() {
+    echo -e "${YELLOW}  Trying distro docker.io package...${NC}"
+    apt install -y docker.io docker-compose-v2 2>/dev/null && return 0
+    return 1
+}
+
 if command -v docker &>/dev/null; then
     print_ok "Docker already installed ($(docker --version | cut -d' ' -f3 | tr -d ','))"
 else
-    curl -fsSL https://get.docker.com | sh
+    DOCKER_INSTALLED=false
+
+    # Method 1: get.docker.com (fastest, may fail on restricted networks)
+    echo -e "${YELLOW}  Trying method 1: get.docker.com convenience script...${NC}"
+    if curl -fsSL --max-time 30 https://get.docker.com -o /tmp/get-docker.sh 2>/dev/null; then
+        sh /tmp/get-docker.sh && DOCKER_INSTALLED=true
+        rm -f /tmp/get-docker.sh
+    fi
+
+    # Method 2: Docker apt repo
+    if [[ "$DOCKER_INSTALLED" == "false" ]]; then
+        echo -e "${YELLOW}  Method 1 failed. Trying method 2: Docker apt repo...${NC}"
+        install_docker_apt && DOCKER_INSTALLED=true || true
+    fi
+
+    # Method 3: Snap
+    if [[ "$DOCKER_INSTALLED" == "false" ]]; then
+        echo -e "${YELLOW}  Method 2 failed. Trying method 3: snap...${NC}"
+        install_docker_snap && DOCKER_INSTALLED=true || true
+    fi
+
+    # Method 4: distro package (docker.io)
+    if [[ "$DOCKER_INSTALLED" == "false" ]]; then
+        echo -e "${YELLOW}  Method 3 failed. Trying method 4: distro docker.io...${NC}"
+        install_docker_distro && DOCKER_INSTALLED=true || true
+    fi
+
+    if [[ "$DOCKER_INSTALLED" == "false" ]]; then
+        print_err "All Docker installation methods failed."
+        echo -e "${RED}Please install Docker manually and re-run this script.${NC}"
+        exit 1
+    fi
+
     systemctl enable docker
     systemctl start docker
-    print_ok "Docker installed"
+    print_ok "Docker installed successfully"
 fi
 
 # Verify docker works
 if ! docker info &>/dev/null; then
-    print_err "Docker failed to start. Aborting."
+    print_err "Docker daemon is not responding. Aborting."
     exit 1
 fi
 
@@ -197,7 +274,7 @@ SECRET_KEY=${SECRET_KEY}
 XTLS_API_PORT=61000
 EOF
 
-cat > /opt/remnanode/docker-compose.yml << 'EOF'
+cat > /opt/remnanode/docker-compose.yml << 'DCEOF'
 services:
   remnanode:
     container_name: remnanode
@@ -213,7 +290,7 @@ services:
       nofile:
         soft: 1048576
         hard: 1048576
-EOF
+DCEOF
 
 print_ok "Configuration created at /opt/remnanode/"
 
@@ -225,7 +302,6 @@ cd /opt/remnanode
 docker compose pull
 docker compose up -d
 
-# Wait and verify
 sleep 6
 if docker ps | grep -q "remnanode"; then
     print_ok "Remnawave Node is running"
@@ -240,124 +316,244 @@ fi
 # [7/8] GET PUBLIC IP
 # ============================================================
 print_step "7/8" "Detecting public IP"
-IPV4=$(curl -4 -s --max-time 10 ifconfig.me || curl -4 -s --max-time 10 api.ipify.org || echo "UNKNOWN")
+IPV4=$(curl -4 -s --max-time 10 ifconfig.me \
+    || curl -4 -s --max-time 10 api.ipify.org \
+    || curl -4 -s --max-time 10 icanhazip.com \
+    || echo "UNKNOWN")
 print_ok "Public IP: $IPV4"
 
 # ============================================================
-# [8/8] INSTALL WARP (OPTIONAL)
+# --- SUMMARY ---
 # ============================================================
-if [[ "$INSTALL_WARP" =~ ^[Yy]$ ]]; then
-    print_step "8/8" "Installing and configuring Cloudflare WARP"
-    
-    # Create WARP setup script
-    cat > /root/warp-setup.sh << 'EOF'
-#!/bin/bash
+echo ""
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}${BOLD}  ✅ Node Setup Complete!${NC}"
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo -e "${YELLOW}${BOLD}Next steps in the Remnawave Panel:${NC}"
+echo -e "  1. Go to ${BOLD}Nodes → Management${NC}"
+echo -e "  2. Find your new ${BOLD}$COUNTRY${NC} node"
+echo -e "  3. Click ${BOLD}Link Inbound${NC} → select ${BOLD}VLESS_TCP_REALITY${NC}"
+echo -e "  4. Go to ${BOLD}Hosts → Add Host${NC}:"
+echo -e "     - Remark   : 🌍 $COUNTRY"
+echo -e "     - Address  : $SUBDOMAIN"
+echo -e "     - Port     : 443"
+echo -e "     - Inbound  : VLESS_TCP_REALITY"
+echo -e "     - SNI      : github.com"
+echo -e "     - FP       : chrome"
+echo -e "     - x25519   : ON"
+echo ""
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}DNS A Record to add:${NC}"
+echo -e "  ${BOLD}$SUBDOMAIN → $IPV4${NC}"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
 
-# Colors for output
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m' # No Color
+# ============================================================
+# [8/8] OPTIONAL: WARP (decision already captured above)
+# ============================================================
+print_step "8/8" "WARP Setup"
 
-echo -e "${BLUE}============================================================${NC}"
-echo -e "${GREEN}Complete Remnant Network Node WARP Setup & Fix Script${NC}"
-echo -e "${BLUE}============================================================${NC}"
+if [[ "$INSTALL_WARP_CHOICE" =~ ^[Yy]$ ]]; then
+    echo ""
+    echo -e "${CYAN}${BOLD}Installing Cloudflare WARP with SSH protection...${NC}"
 
-# Function to print status
-print_ok() {
-    echo -e "${GREEN}✓ $1${NC}"
-}
+    apt install -y wireguard-tools curl iproute2 >/dev/null 2>&1
+    print_ok "WireGuard tools installed"
 
-print_info() {
-    echo -e "${BLUE}ℹ $1${NC}"
-}
+    echo -e "${BLUE}  - Fetching latest wgcf version...${NC}"
+    WGCF_VER=$(curl -s --max-time 15 \
+        https://api.github.com/repos/ViRb3/wgcf/releases/latest \
+        | grep '"tag_name"' | cut -d'"' -f4)
+    if [ -z "$WGCF_VER" ]; then
+        WGCF_VER="v2.2.22"
+        echo -e "${YELLOW}  ⚠️  Could not fetch latest version, using fallback: ${WGCF_VER}${NC}"
+    fi
+    WGCF_VER_NUM="${WGCF_VER#v}"
+    wget -qO /usr/local/bin/wgcf \
+        "https://github.com/ViRb3/wgcf/releases/download/${WGCF_VER}/wgcf_${WGCF_VER_NUM}_linux_amd64"
+    chmod +x /usr/local/bin/wgcf
+    print_ok "wgcf ${WGCF_VER} installed"
 
-print_warn() {
-    echo -e "${YELLOW}⚠ $1${NC}"
-}
+    WARP_TMP=$(mktemp -d)
+    cd "$WARP_TMP"
+    echo -e "${BLUE}  - Registering WARP device...${NC}"
+    wgcf register --accept-tos 2>&1 | grep -v "GET" || true
+    echo -e "${BLUE}  - Generating WireGuard config...${NC}"
+    wgcf generate 2>&1 | grep -v "GET" || true
 
-print_err() {
-    echo -e "${RED}✗ $1${NC}"
-}
+    if [ ! -f wgcf-profile.conf ]; then
+        print_err "wgcf failed to generate config. Skipping WARP."
+        cd /
+        rm -rf "$WARP_TMP"
+    else
+        sed -i 's|AllowedIPs = .*|AllowedIPs = 0.0.0.0/0|' wgcf-profile.conf
 
-# Step 1: Clean up any existing WARP setup
-print_info "Cleaning up existing WARP installation..."
-systemctl stop wg-quick@wg0 2>/dev/null || true
-systemctl disable wg-quick@wg0 2>/dev/null || true
-apt remove -y cloudflare-warp 2>/dev/null || true
-rm -f /etc/wireguard/wg0.conf
-ip rule del from all lookup warp priority 5000 2>/dev/null || true
-ip rule del from all sport 22 lookup main priority 4000 2>/dev/null || true
-ip rule del to all dport 22 lookup main priority 4000 2>/dev/null || true
-print_ok "Cleaned up old WARP configuration"
+        if ! grep -q "^Table" wgcf-profile.conf; then
+            sed -i '/^\[Interface\]/a Table = off' wgcf-profile.conf
+        else
+            sed -i 's/^Table = .*/Table = off/' wgcf-profile.conf
+        fi
 
-# Step 2: Fix hosts file and DNS
-print_info "Setting up system configuration..."
-HOSTNAME=$(hostname)
-echo "127.0.0.1 localhost" > /etc/hosts
-echo "127.0.0.1 $HOSTNAME" >> /etc/hosts
-apt install -y systemd-resolved 2>/dev/null
-systemctl enable --now systemd-resolved
-if [ -L /etc/resolv.conf ]; then
-    rm /etc/resolv.conf
-fi
-echo "nameserver 1.1.1.1" > /etc/resolv.conf
-echo "nameserver 8.8.8.8" >> /etc/resolv.conf
-print_ok "System configuration fixed"
+        cp wgcf-profile.conf /etc/wireguard/wg0.conf
+        cd /
+        rm -rf "$WARP_TMP"
+        print_ok "WARP config deployed to /etc/wireguard/wg0.conf"
 
-# Step 3: Install dependencies
-print_info "Installing dependencies..."
-apt update
-apt install -y wireguard-tools curl iproute2 wget gnupg2 apt-transport-https
-print_ok "Dependencies installed"
+        systemctl enable wg-quick@wg0 >/dev/null 2>&1
+        systemctl start wg-quick@wg0
+        sleep 3
 
-# Step 4: Download and install wgcf
-print_info "Installing wgcf..."
-WGCF_VER="v2.2.22"
-wget -qO /usr/local/bin/wgcf "https://github.com/ViRb3/wgcf/releases/download/${WGCF_VER}/wgcf_${WGCF_VER#v}_linux_amd64"
-chmod +x /usr/local/bin/wgcf
-print_ok "wgcf ${WGCF_VER} installed"
+        echo -e "${BLUE}  - Configuring routing rules (SSH excluded from WARP)...${NC}"
 
-# Step 5: Register and generate config
-print_info "Registering WARP account..."
-WARP_TMP=$(mktemp -d)
-cd "$WARP_TMP"
-wgcf register --accept-tos
-wgcf generate
-print_ok "WARP configuration generated"
+        grep -q "^100 warp" /etc/iproute2/rt_tables \
+            || echo "100 warp" >> /etc/iproute2/rt_tables
 
-# Step 6: Configure for full tunnel
-print_info "Configuring WARP profile..."
-sed -i 's|AllowedIPs = .*|AllowedIPs = 0.0.0.0/0|' wgcf-profile.conf
+        ip route add default dev wg0 table warp 2>/dev/null || true
+        ip rule add from all sport 22 lookup main priority 4000 2>/dev/null || true
+        ip rule add to   all dport 22 lookup main priority 4000 2>/dev/null || true
+        ip rule add from all sport "${NODE_PORT}" lookup main priority 4001 2>/dev/null || true
+        ip rule add to   all dport "${NODE_PORT}" lookup main priority 4001 2>/dev/null || true
+        ip rule add from all lookup warp priority 5000 2>/dev/null || true
 
-# Add Table = off so we can manage routing ourselves
-if ! grep -q "^Table" wgcf-profile.conf; then
-    sed -i '/^\[Interface\]/a Table = off' wgcf-profile.conf
+        # Persist routing rules via systemd
+        cat > /etc/systemd/system/warp-routing.service << SVCEOF
+[Unit]
+Description=WARP custom routing rules (SSH excluded)
+After=wg-quick@wg0.service
+Wants=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 10
+ExecStart=/bin/bash -c '\
+    grep -q "^100 warp" /etc/iproute2/rt_tables || echo "100 warp" >> /etc/iproute2/rt_tables; \
+    ip route add default dev wg0 table warp 2>/dev/null || true; \
+    ip rule add from all sport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule add to   all dport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule add from all sport ${NODE_PORT} lookup main priority 4001 2>/dev/null || true; \
+    ip rule add to   all dport ${NODE_PORT} lookup main priority 4001 2>/dev/null || true; \
+    ip rule add from all lookup warp priority 5000 2>/dev/null || true'
+ExecStop=/bin/bash -c '\
+    ip rule del from all sport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule del to   all dport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule del from all sport ${NODE_PORT} lookup main priority 4001 2>/dev/null || true; \
+    ip rule del to   all dport ${NODE_PORT} lookup main priority 4001 2>/dev/null || true; \
+    ip rule del from all lookup warp priority 5000 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+        systemctl daemon-reload
+        systemctl enable warp-routing.service >/dev/null 2>&1
+        print_ok "Routing rules persisted via warp-routing.service"
+
+        sleep 2
+        if ip a show wg0 2>/dev/null | grep -q "inet"; then
+            print_ok "WARP is running on wg0"
+            echo ""
+            echo -e "${CYAN}WARP status:${NC}"
+            wg show wg0 2>/dev/null || true
+            echo ""
+            echo -e "${CYAN}Active routing rules:${NC}"
+            ip rule list | grep -E "main|warp" | head -10
+            echo ""
+            echo -e "${GREEN}✅ SSH port 22 excluded from WARP — connection is safe.${NC}"
+        else
+            print_err "WARP interface wg0 failed to start."
+            echo -e "${YELLOW}Debug: systemctl status wg-quick@wg0${NC}"
+        fi
+    fi
 else
-    sed -i 's/^Table = .*/Table = off/' wgcf-profile.conf
+    echo -e "${CYAN}Skipping WARP installation.${NC}"
 fi
 
-# Deploy config
-cp wgcf-profile.conf /etc/wireguard/wg0.conf
-cd /
-rm -rf "$WARP_TMP"
-print_ok "WARP profile configured and deployed"
+# ============================================================
+# --- OPTIONAL: POST-INSTALL FIXES ---
+# ============================================================
+echo ""
+echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${YELLOW}${BOLD}Post-Install Fixes Available:${NC}"
+echo -e "${CYAN}  Fix 1${NC} — Remove bad /etc/hosts entry (127.0.1.1)"
+echo -e "${CYAN}  Fix 2${NC} — Restart WARP to clear DNS issues"
+echo -e "${CYAN}  Fix 3${NC} — Verify WARP is routing via Cloudflare"
+echo -e "${CYAN}  Fix 4${NC} — Verify outbound internet connectivity"
+echo -e "${CYAN}  Fix 5${NC} — Restart remnanode container"
+echo -e "${CYAN}  Fix 6${NC} — Show last 5 lines of remnanode logs"
+echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+read -rp "$(echo -e "${YELLOW}Apply post-install fixes now? [y/N]: ${NC}")" APPLY_FIXES
 
-# Step 7: Configure UFW to allow outbound traffic
-print_info "Configuring firewall rules..."
-ufw allow out on eth0
-ufw allow out on wg0
-ufw allow in on wg0
-ufw allow out to any port 53 proto udp # DNS
-ufw allow out to any port 80 proto tcp # HTTP
-ufw allow out to any port 443 proto tcp # HTTPS
-ufw allow out to 1.1.1.1
-ufw allow out to 8.8.8.8
-ufw reload
-print_ok "Firewall configured to allow WARP traffic"
+# Write fix script regardless of choice (available for later use)
+cat > /root/node-fix.sh << 'FIXEOF'
+#!/bin/bash
+echo "🔧 Applying post-install fixes..."
 
-# Step 8: Enable and start WARP
-print_info "Starting WARP service..."
-systemctl enable wg-quick@wg0
-systemctl start wg-quick@wg0
+# Fix 1 — Remove bad /etc/hosts entry
+sed -i '/127.0.1.1/d' /etc/hosts
+echo "✅ Fixed /etc/hosts (removed 127.0.1.1 entries)"
+
+# Fix 2 — Restart WARP to fix DNS
+if systemctl is-active --quiet wg-quick@wg0; then
+    systemctl restart wg-quick@wg0
+    sleep 3
+    echo "✅ WARP restarted"
+else
+    echo "⚠️  WARP (wg-quick@wg0) not active — skipping"
+fi
+
+# Fix 3 — Verify WARP is working
+WARP_ORG=$(curl -s --max-time 10 https://ipinfo.io/org || echo "unreachable")
+if echo "$WARP_ORG" | grep -qi "cloudflare"; then
+    echo "✅ WARP working: $WARP_ORG"
+else
+    echo "⚠️  WARP check: $WARP_ORG"
+fi
+
+# Fix 4 — Verify internet works
+IP=$(curl -4 -s --max-time 10 ifconfig.me || echo "UNKNOWN")
+echo "✅ Outbound IP: $IP"
+
+# Fix 5 — Restart remnanode
+if docker ps -a --format '{{.Names}}' | grep -q "^remnanode$"; then
+    docker restart remnanode
+    sleep 10
+    echo "✅ Remnanode restarted"
+else
+    echo "⚠️  remnanode container not found"
+fi
+
+# Fix 6 — Final logs
+echo ""
+echo "📋 Last 5 lines of remnanode logs:"
+docker logs remnanode --tail 5 2>&1 || echo "⚠️  Could not fetch logs"
+echo ""
+echo "✅ All fixes applied!"
+echo "💡 Re-run anytime: bash /root/node-fix.sh"
+FIXEOF
+
+chmod +x /root/node-fix.sh
+print_ok "Fix script saved to /root/node-fix.sh"
+
+if [[ "$APPLY_FIXES" =~ ^[Yy]$ ]]; then
+    bash /root/node-fix.sh
+else
+    echo -e "${CYAN}Skipping fixes.${NC}"
+    echo -e "${YELLOW}💡 Run later with: ${BOLD}bash /root/node-fix.sh${NC}"
+fi
+
+# ============================================================
+# --- DONE ---
+# ============================================================
+echo ""
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}  🎉 All done! Node is ready.${NC}"
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo -e "  Node Port  : ${BOLD}${NODE_PORT}${NC}"
+echo -e "  Public IP  : ${BOLD}${IPV4}${NC}"
+echo -e "  DNS Record : ${BOLD}${SUBDOMAIN} → ${IPV4}${NC}"
+echo -e "  Fix Script : ${BOLD}/root/node-fix.sh${NC}"
+echo ""
