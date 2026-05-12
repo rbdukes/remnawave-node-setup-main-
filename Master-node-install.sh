@@ -88,10 +88,6 @@ while true; do
     echo -e "${RED}Secret key is required!${NC}"
 done
 
-# ============================================================
-# FIX: Use [[ ]] for regex/string matching — fixes line 102 error
-# ============================================================
-
 # Normalize WARP choice
 if [[ "$INSTALL_WARP_CHOICE" =~ ^[Yy]$ ]]; then
     WARP_DISPLAY="Yes"
@@ -112,7 +108,6 @@ echo -e "  WARP       : ${BOLD}$WARP_DISPLAY${NC}"
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 read -rp "$(echo -e "${YELLOW}Proceed with installation? [y/N]: ${NC}")" CONFIRM
-# FIX: [[ ]] instead of [ ] for =~ operator
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     echo -e "${RED}Installation cancelled.${NC}"
     exit 0
@@ -175,12 +170,28 @@ print_ok "Firewall configured (22, 80, 443, ${NODE_PORT}, 61000)"
 # ============================================================
 print_step "4/8" "Installing Docker"
 
+DOCKER_INSTALLED=false
+DOCKER_IS_SNAP=false
+
+install_docker_get_script() {
+    echo -e "${YELLOW}  Trying method 1: get.docker.com convenience script...${NC}"
+    if curl -fsSL --max-time 30 https://get.docker.com -o /tmp/get-docker.sh 2>/dev/null; then
+        if sh /tmp/get-docker.sh 2>/dev/null; then
+            rm -f /tmp/get-docker.sh
+            return 0
+        fi
+    fi
+    rm -f /tmp/get-docker.sh
+    return 1
+}
+
 install_docker_apt() {
-    echo -e "${YELLOW}  Trying Docker apt repository method...${NC}"
+    echo -e "${YELLOW}  Trying method 2: Docker apt repository...${NC}"
     apt install -y ca-certificates curl gnupg lsb-release 2>/dev/null || true
     install -m 0755 -d /etc/apt/keyrings
 
-    if curl -fsSL --max-time 30 https://download.docker.com/linux/ubuntu/gpg \
+    if curl -fsSL --max-time 30 \
+        https://download.docker.com/linux/ubuntu/gpg \
         -o /etc/apt/keyrings/docker.asc 2>/dev/null; then
         chmod a+r /etc/apt/keyrings/docker.asc
         echo \
@@ -190,54 +201,61 @@ install_docker_apt() {
           $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
           tee /etc/apt/sources.list.d/docker.list > /dev/null
         apt update -y
-        apt install -y docker-ce docker-ce-cli containerd.io \
-            docker-buildx-plugin docker-compose-plugin
-        return 0
+        if apt install -y docker-ce docker-ce-cli containerd.io \
+            docker-buildx-plugin docker-compose-plugin 2>/dev/null; then
+            return 0
+        fi
     fi
     return 1
 }
 
 install_docker_snap() {
-    echo -e "${YELLOW}  Trying Docker snap method...${NC}"
+    echo -e "${YELLOW}  Trying method 3: snap...${NC}"
     apt install -y snapd 2>/dev/null || true
-    snap install docker 2>/dev/null && return 0
+    if snap install docker 2>/dev/null; then
+        sleep 5
+        # Snap Docker uses different service name
+        systemctl enable snap.docker.dockerd 2>/dev/null || true
+        systemctl start snap.docker.dockerd 2>/dev/null || true
+        # Add snap bin to PATH
+        export PATH="/snap/bin:$PATH"
+        echo 'export PATH="/snap/bin:$PATH"' >> /root/.bashrc
+        DOCKER_IS_SNAP=true
+        return 0
+    fi
     return 1
 }
 
 install_docker_distro() {
-    echo -e "${YELLOW}  Trying distro docker.io package...${NC}"
-    apt install -y docker.io docker-compose-v2 2>/dev/null && return 0
+    echo -e "${YELLOW}  Trying method 4: distro docker.io package...${NC}"
+    if apt install -y docker.io docker-compose-v2 2>/dev/null; then
+        return 0
+    fi
     return 1
 }
 
 if command -v docker &>/dev/null; then
     print_ok "Docker already installed ($(docker --version | cut -d' ' -f3 | tr -d ','))"
+    DOCKER_INSTALLED=true
+    # Check if it is snap docker
+    if snap list docker &>/dev/null 2>&1; then
+        DOCKER_IS_SNAP=true
+        export PATH="/snap/bin:$PATH"
+    fi
 else
-    DOCKER_INSTALLED=false
-
-    # Method 1: get.docker.com (fastest, may fail on restricted networks)
-    echo -e "${YELLOW}  Trying method 1: get.docker.com convenience script...${NC}"
-    if curl -fsSL --max-time 30 https://get.docker.com -o /tmp/get-docker.sh 2>/dev/null; then
-        sh /tmp/get-docker.sh && DOCKER_INSTALLED=true
-        rm -f /tmp/get-docker.sh
-    fi
-
-    # Method 2: Docker apt repo
-    if [[ "$DOCKER_INSTALLED" == "false" ]]; then
-        echo -e "${YELLOW}  Method 1 failed. Trying method 2: Docker apt repo...${NC}"
-        install_docker_apt && DOCKER_INSTALLED=true || true
-    fi
-
-    # Method 3: Snap
-    if [[ "$DOCKER_INSTALLED" == "false" ]]; then
-        echo -e "${YELLOW}  Method 2 failed. Trying method 3: snap...${NC}"
-        install_docker_snap && DOCKER_INSTALLED=true || true
-    fi
-
-    # Method 4: distro package (docker.io)
-    if [[ "$DOCKER_INSTALLED" == "false" ]]; then
-        echo -e "${YELLOW}  Method 3 failed. Trying method 4: distro docker.io...${NC}"
-        install_docker_distro && DOCKER_INSTALLED=true || true
+    # Try each method in order
+    if install_docker_get_script; then
+        DOCKER_INSTALLED=true
+        print_ok "Docker installed via get.docker.com"
+    elif install_docker_apt; then
+        DOCKER_INSTALLED=true
+        print_ok "Docker installed via apt repository"
+    elif install_docker_snap; then
+        DOCKER_INSTALLED=true
+        print_ok "Docker installed via snap"
+    elif install_docker_distro; then
+        DOCKER_INSTALLED=true
+        print_ok "Docker installed via docker.io"
     fi
 
     if [[ "$DOCKER_INSTALLED" == "false" ]]; then
@@ -246,16 +264,30 @@ else
         exit 1
     fi
 
-    systemctl enable docker
-    systemctl start docker
-    print_ok "Docker installed successfully"
+    # Enable and start correct service
+    if [[ "$DOCKER_IS_SNAP" == "true" ]]; then
+        systemctl enable snap.docker.dockerd 2>/dev/null || true
+        systemctl start snap.docker.dockerd 2>/dev/null || true
+        sleep 5
+    else
+        systemctl enable docker 2>/dev/null || true
+        systemctl start docker 2>/dev/null || true
+    fi
 fi
 
-# Verify docker works
-if ! docker info &>/dev/null; then
-    print_err "Docker daemon is not responding. Aborting."
-    exit 1
-fi
+# Wait for Docker to be ready
+echo -e "${YELLOW}  Waiting for Docker daemon to be ready...${NC}"
+DOCKER_WAIT=0
+until docker info &>/dev/null; do
+    sleep 2
+    DOCKER_WAIT=$((DOCKER_WAIT + 2))
+    if [ "$DOCKER_WAIT" -ge 30 ]; then
+        print_err "Docker daemon is not responding after 30s. Aborting."
+        exit 1
+    fi
+done
+
+print_ok "Docker is ready ($(docker --version | cut -d' ' -f3 | tr -d ','))"
 
 # ============================================================
 # [5/8] CONFIGURE REMNANODE
@@ -299,9 +331,11 @@ print_ok "Configuration created at /opt/remnanode/"
 # ============================================================
 print_step "6/8" "Starting Remnawave Node"
 cd /opt/remnanode
+
 docker compose pull
 docker compose up -d
 
+# Wait and verify
 sleep 6
 if docker ps | grep -q "remnanode"; then
     print_ok "Remnawave Node is running"
@@ -350,7 +384,7 @@ echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 
 # ============================================================
-# [8/8] OPTIONAL: WARP (decision already captured above)
+# [8/8] OPTIONAL: WARP
 # ============================================================
 print_step "8/8" "WARP Setup"
 
@@ -461,6 +495,7 @@ SVCEOF
             ip rule list | grep -E "main|warp" | head -10
             echo ""
             echo -e "${GREEN}✅ SSH port 22 excluded from WARP — connection is safe.${NC}"
+            echo -e "${CYAN}Note: Make sure XRay template outbound points to \"interface\": \"wg0\"${NC}"
         else
             print_err "WARP interface wg0 failed to start."
             echo -e "${YELLOW}Debug: systemctl status wg-quick@wg0${NC}"
@@ -486,7 +521,7 @@ echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━
 echo ""
 read -rp "$(echo -e "${YELLOW}Apply post-install fixes now? [y/N]: ${NC}")" APPLY_FIXES
 
-# Write fix script regardless of choice (available for later use)
+# Write fix script regardless of choice
 cat > /root/node-fix.sh << 'FIXEOF'
 #!/bin/bash
 echo "🔧 Applying post-install fixes..."
