@@ -99,7 +99,7 @@ echo -e "  Country    : ${BOLD}$COUNTRY${NC}"
 echo -e "  Subdomain  : ${BOLD}$SUBDOMAIN${NC}"
 echo -e "  Node Port  : ${BOLD}$NODE_PORT${NC}"
 echo -e "  Panel URL  : ${BOLD}$PANEL_URL${NC}"
-echo -e "  WARP       : ${BOLD}$([ "$INSTALL_WARP" =~ ^[Yy]$ ] && echo "Yes" || echo "No")${NC}"
+echo -e "  WARP       : ${BOLD}$([[ "$INSTALL_WARP" =~ ^[Yy]$ ]] && echo "Yes" || echo "No")${NC}"
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 read -rp "$(echo -e "${YELLOW}Proceed with installation? [y/N]: ${NC}")" CONFIRM
@@ -152,6 +152,7 @@ print_ok "Hostname set to: ${COUNTRY_LOWER}-node"
 # [3/8] FIREWALL
 # ============================================================
 print_step "3/8" "Configuring firewall (UFW)"
+apt install -y ufw || true
 ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
@@ -168,16 +169,34 @@ print_step "4/8" "Installing Docker"
 if command -v docker &>/dev/null; then
     print_ok "Docker already installed ($(docker --version | cut -d' ' -f3 | tr -d ','))"
 else
-    curl -fsSL https://get.docker.com | sh
-    systemctl enable docker
-    systemctl start docker
-    print_ok "Docker installed"
+    echo -e "${YELLOW}Trying multiple Docker installation methods...${NC}"
+    
+    # Method 1: get.docker.com
+    if curl -fsSL --connect-timeout 10 --max-time 60 https://get.docker.com | sh; then
+        systemctl enable docker
+        systemctl start docker
+        print_ok "Docker installed via get.docker.com"
+    # Method 2: direct package
+    elif apt update && apt install -y docker.io; then
+        systemctl enable docker
+        systemctl start docker
+        print_ok "Docker installed via apt"
+    else
+        print_err "Docker installation failed"
+        exit 1
+    fi
 fi
 
 # Verify docker works
 if ! docker info &>/dev/null; then
     print_err "Docker failed to start. Aborting."
     exit 1
+fi
+
+# Check for docker compose and install if needed
+if ! docker compose version &>/dev/null && ! docker-compose --version &>/dev/null; then
+    echo -e "${YELLOW}Installing docker-compose...${NC}"
+    apt install -y docker-compose-plugin || apt install -y docker-compose || true
 fi
 
 # ============================================================
@@ -222,17 +241,27 @@ print_ok "Configuration created at /opt/remnanode/"
 # ============================================================
 print_step "6/8" "Starting Remnawave Node"
 cd /opt/remnanode
-docker compose pull
-docker compose up -d
+
+# Handle both docker compose and docker-compose commands
+if docker compose version &>/dev/null; then
+    docker compose pull
+    docker compose up -d
+elif docker-compose --version &>/dev/null; then
+    docker-compose pull
+    docker-compose up -d
+else
+    print_err "Neither docker compose nor docker-compose is available"
+    exit 1
+fi
 
 # Wait and verify
 sleep 6
 if docker ps | grep -q "remnanode"; then
     print_ok "Remnawave Node is running"
-    docker compose logs --tail=15
+    docker compose logs --tail=15 2>/dev/null || docker-compose logs --tail=15
 else
     print_err "Container failed to start. Logs:"
-    docker compose logs --tail=30
+    docker compose logs --tail=30 2>/dev/null || docker-compose logs --tail=30
     exit 1
 fi
 
@@ -325,7 +354,9 @@ WARP_TMP=$(mktemp -d)
 cd "$WARP_TMP"
 wgcf register --accept-tos
 wgcf generate
-print_ok "WARP configuration generated"
+print_ok "W# Step 6: Configure for full tunnel
+print_info "Configuring WARP profile..."
+sed -i 's|AllowedIPs = .*|AllowedIPs = 0.0.0.0/0|' wgcf-profile.conf
 
 # Step 6: Configure for full tunnel
 print_info "Configuring WARP profile..."
@@ -361,3 +392,108 @@ print_ok "Firewall configured to allow WARP traffic"
 print_info "Starting WARP service..."
 systemctl enable wg-quick@wg0
 systemctl start wg-quick@wg0
+
+# Step 9: Set up routing rules to keep SSH direct
+print_info "Configuring routing rules (SSH excluded from WARP)..."
+grep -q "^100 warp" /etc/iproute2/rt_tables || echo "100 warp" >> /etc/iproute2/rt_tables
+ip route add default dev wg0 table warp 2>/dev/null || true
+ip rule add from all sport 22 lookup main priority 4000 2>/dev/null || true
+ip rule add to all dport 22 lookup main priority 4000 2>/dev/null || true
+ip rule add from all lookup warp priority 5000 2>/dev/null || true
+
+# Step 10: Create service to maintain routing rules
+cat > /etc/systemd/system/warp-routing.service << 'WARPEOF'
+[Unit]
+Description=WARP custom routing rules (SSH excluded)
+After=wg-quick@wg0.service
+Wants=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 5
+ExecStart=/bin/bash -c '\
+    grep -q "^100 warp" /etc/iproute2/rt_tables || echo "100 warp" >> /etc/iproute2/rt_tables; \
+    ip route add default dev wg0 table warp 2>/dev/null || true; \
+    ip rule add from all sport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule add to all dport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule add from all lookup warp priority 5000 2>/dev/null || true'
+ExecStop=/bin/bash -c '\
+    ip rule del from all sport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule del to all dport 22 lookup main priority 4000 2>/dev/null || true; \
+    ip rule del from all lookup warp priority 5000 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+WARPEOF
+
+systemctl daemon-reload
+systemctl enable warp-routing.service
+systemctl start warp-routing.service
+
+print_ok "WARP routing configured to exclude SSH"
+
+# Step 11: Verify WARP is working
+sleep 5
+if ip a show wg0 2>/dev/null | grep -q "inet"; then
+    print_ok "WARP is running on wg0"
+    
+    # Test connectivity through WARP
+    ORIGINAL_IP=$(curl -4s https://ifconfig.me)
+    WARP_IP=$(curl -4s --interface wg0 https://ifconfig.me 2>/dev/null || echo "Could not determine")
+    
+    echo ""
+    echo -e "${BLUE}=============== WARP STATUS ===============${NC}"
+    echo -e "Original IP: ${YELLOW}${ORIGINAL_IP}${NC}"
+    echo -e "WARP IP    : ${GREEN}${WARP_IP}${NC}"
+    echo -e "${BLUE}==========================================${NC}"
+    
+    if [ "$ORIGINAL_IP" != "$WARP_IP" ] && [ "$WARP_IP" != "Could not determine" ]; then
+        print_ok "WARP is working correctly!"
+    else
+        print_warn "WARP may not be routing traffic correctly"
+    fi
+else
+    print_err "WARP interface wg0 failed to start"
+fi
+
+print_info "WARP setup complete! SSH connections are protected from WARP routing."
+EOF
+
+    # Execute the WARP setup script
+    chmod +x /root/warp-setup.sh
+    bash /root/warp-setup.sh
+    
+    print_ok "WARP setup completed. SSH is protected from WARP routing."
+    print_ok "You can re-run WARP setup anytime with: bash /root/warp-setup.sh"
+else
+    echo -e "${YELLOW}Skipping WARP installation as requested.${NC}"
+fi
+
+# ============================================================
+# --- SUMMARY ---
+# ============================================================
+echo ""
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}${BOLD}  ✅ Node Setup Complete!${NC}"
+echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo -e "${YELLOW}${BOLD}Next steps in the Remnawave Panel:${NC}"
+echo -e "  1. Go to ${BOLD}Nodes → Management${NC}"
+echo -e "  2. Find your new ${BOLD}$COUNTRY${NC} node"
+echo -e "  3. Click ${BOLD}Link Inbound${NC} → select ${BOLD}VLESS_TCP_REALITY${NC}"
+echo -e "  4. Go to ${BOLD}Hosts → Add Host${NC}:"
+echo -e "     - Remark   : 🌍 $COUNTRY"
+echo -e "     - Address  : $SUBDOMAIN"
+echo -e "     - Port     : 443"
+echo -e "     - Inbound  : VLESS_TCP_REALITY"
+echo -e "     - SNI      : github.com"
+echo -e "     - FP       : chrome"
+echo -e "     - x25519   : ON"
+echo ""
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}DNS A Record to add:${NC}"
+echo -e "  ${BOLD}$SUBDOMAIN → $IPV4${NC}"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo -e "${GREEN}Installation completed successfully!${NC}"
